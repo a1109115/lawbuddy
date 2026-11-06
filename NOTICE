@@ -1,0 +1,31 @@
+LawBuddy
+Copyright 2026 LawBuddy Authors
+
+This product includes software developed by third parties.
+本产品包含第三方组件，其版权与许可声明见 THIRD_PARTY_NOTICES.md。
+
+---------------------------------------------------------------------------
+许可范围例外声明 / Scope Exception
+---------------------------------------------------------------------------
+
+本仓库中下列内容**不适用**根目录 LICENSE（Apache-2.0）所授予的权利，
+尤其不包含其中的商业使用许可：
+
+  services/core/seed/skills/@team/case-file-review/references/cause-of-action-wiki/
+
+该目录系对第三方出版物《民事案件案由适用要点与请求权规范指引（第三版）》的
+结构化整理，著作权归原作者及出版方所有。其自身声明为「仅供个人学习、研究使用，
+请勿用于商业目的」，详见该目录下的 DISCLAIMER.md。
+
+若你需要在商业场景中使用该部分内容，请自行取得权利人授权，或从项目中移除该目录。
+
+除上述明确列出的部分外，本仓库其余代码与文档以 Apache-2.0 授权，
+全文见 LICENSE。
+
+---------------------------------------------------------------------------
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use the files covered by that license except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
