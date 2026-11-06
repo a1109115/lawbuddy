@@ -1,0 +1,39 @@
+# 本文件只承载工具链配置，不定义 [project] 表。
+#
+# 原因：services/core 不是发布到 PyPI 的独立包，而是经由 PyInstaller
+# （services/core/lawbuddy-core.spec）冻结成 lawbuddy-core 可执行文件，
+# 随 Electron 安装包分发。因此 Python 版本约束放在 .python-version 与
+# CONTRIBUTING.md 中，而不是打包元数据里。
+#
+# 依赖安装仍以 services/core/requirements.txt 为准。
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+exclude = [
+  "build",
+  "dist_core",
+  ".venv",
+  "__pycache__",
+]
+
+[tool.ruff.lint]
+# 阶段一：只启用「语法与确定性错误」类规则，保证 CI 从第一天就是绿的。
+# 覆盖率、未使用导入、命名风格等规则待代码基线清理后分批开启，
+# 避免一次引入数百条告警导致门禁被绕过。
+select = [
+  "E9",   # 语法/解析错误
+  "F63",  # 无效的比较
+  "F7",   # 语法相关（F701-F707 等）
+  "F82",  # 未定义名
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 评测脚本允许保留探索性代码与未使用的导入
+"services/core/evals/**" = ["F401", "F841"]
+"services/core/scripts/**" = ["F401", "F841"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"

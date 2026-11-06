@@ -1,0 +1,22 @@
+# 统一换行与二进制标记。
+# 本项目在 Windows 上开发，但 CI 与贡献者可能在其他平台，
+# 若不规范换行，shell 脚本与 Python 脚本会因 CRLF 出现难以定位的失败。
+* text=auto eol=lf
+
+# Windows 脚本必须保留 CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制资源：禁止任何换行符转换与文本 diff
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.onnx binary
+*.woff binary
+*.woff2 binary
+
+# 锁文件不参与 diff 折叠统计
+package-lock.json -diff linguist-generated

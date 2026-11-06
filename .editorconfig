@@ -1,0 +1,26 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.py]
+indent_size = 4
+max_line_length = 120
+
+[*.{ts,tsx,js,jsx,mjs,cjs,json,yml,yaml,css,html}]
+indent_size = 2
+
+[*.md]
+# Markdown 中行尾双空格表示换行，不清理
+trim_trailing_whitespace = false
+
+[*.{ps1,bat,cmd}]
+end_of_line = crlf
+
+[*.{png,jpg,jpeg,gif,ico,onnx,woff,woff2}]
+insert_final_newline = false
