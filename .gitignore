@@ -1,0 +1,54 @@
+node_modules/
+out/
+dist/
+# 打包产物与 PyInstaller 中间目录（数百 MB，不入库）
+apps/desktop/release/
+services/core/dist_core/
+services/core/build/
+*.log
+__pycache__/
+*.pyc
+.venv/
+.trae/
+# Trae 分享包等本地工具产物
+.trae-html-share-packages/
+.DS_Store
+# 案件材料与诉讼文书（敏感，不上传）
+case_file/
+79号法院诉讼文书 (2).pdf
+法律分析建议书_*.docx
+~$*.docx
+# 密钥载荷与本地大模型权重（构建时生成/运行时下载，不入库；离线表格模型除外）
+services/core/models/*
+!services/core/models/slanet-plus.onnx
+services/core/models/builtin-key.bin
+# 本地 AI 工具技能目录
+.agents/
+.claude/
+# 临时测试产物
+_test_pptx/
+services/core/_svgtest.png
+# TypeScript 增量编译缓存
+*.tsbuildinfo
+# 本地截图、宣传片工程、生成页与本地记忆（体积大或仅供本机使用）
+.screenshots/
+lawbuddy-showreel/
+case-review-agent-loop/
+.workbuddy/
+lawbuddy-promo/
+LawBuddy产品页面图/
+lawbuddy-open-source/
+body.html
+lawbuddy.png
+lawbuddy头像.png
+skills-lock.json
+# 环境变量与本地密钥配置（永不入库）
+.env
+.env.*
+!.env.example
+# 评测历史报告（可能含案件文本片段，不入库）
+services/core/evals/reports/
+# 本地设备级配置与工作空间数据
+**/profile.db
+**/workspace.db
+**/workspace.json

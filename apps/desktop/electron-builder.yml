@@ -1,0 +1,35 @@
+# LawBuddy Windows 打包配置（electron-builder）
+# 产物：release/ 下的 NSIS 安装包；安装后开箱即用——
+# Python Core 以 PyInstaller 冻结产物（services/core/lawbuddy-core.spec）随包分发，
+# 安装目录 resources/core/lawbuddy-core.exe 由 Electron Main 直接 spawn（coreProcess.ts）。
+appId: com.lawbuddy.desktop
+productName: LawBuddy
+electronVersion: 44.4.3
+directories:
+  output: release
+  buildResources: build
+# 主/预/渲染进程产物 + 包元数据；主进程除 electron 外无运行时 node_modules 依赖
+# （@lawbuddy/contracts 源码别名打包进 bundle），无需携带 node_modules
+files:
+  - out/**
+  - package.json
+extraResources:
+  - from: ../../services/core/dist_core/lawbuddy-core
+    to: core
+  # 随包分发的技能 / MCP 种子（export_seed.py 产物；认证头值已剥离）：
+  # 安装到 resources/seed，首次初始化工作空间时由 Core 导入
+  - from: ../../services/core/seed
+    to: seed
+win:
+  icon: build/icon.ico
+  target:
+    - nsis
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  artifactName: ${productName}-${version}-${arch}-setup.${ext}
+  shortcutName: LawBuddy
+  uninstallDisplayName: LawBuddy
+# 未签名构建（个人开发者，签名流水线见 M5 规划）；不发自动更新
+publish: null

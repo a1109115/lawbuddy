@@ -1,0 +1,29 @@
+{
+  "name": "lawbuddy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LawBuddy —— 本地优先的法律 AI 桌面应用",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w apps/desktop",
+    "build": "npm run build -w apps/desktop",
+    "typecheck": "npm run typecheck -w apps/desktop",
+    "test": "npm run test -w apps/desktop",
+    "test:e2e-browser": "python scripts/e2e_browser.py",
+    "test:e2e-desktop": "python scripts/e2e_desktop.py",
+    "core:freeze": "cd services\\core && .venv\\Scripts\\python.exe -m PyInstaller --noconfirm --clean --distpath dist_core lawbuddy-core.spec",
+    "core:smoke": "cd services\\core && .venv\\Scripts\\python.exe scripts\\_smoke_frozen_encoding.py dist_core && .venv\\Scripts\\python.exe scripts\\_smoke_frozen_core.py dist_core && .venv\\Scripts\\python.exe scripts\\_smoke_frozen_ocr.py dist_core",
+    "scan:secrets": "node scripts/scan-secrets.mjs",
+    "seed:export": "cd services\\core && .venv\\Scripts\\python.exe scripts\\export_seed.py",
+    "dist:win": "npm run build && npm run core:freeze && npm run seed:export && npm run scan:secrets && npm run dist -w apps/desktop"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "pptx-preview": "^1.0.7"
+  }
+}

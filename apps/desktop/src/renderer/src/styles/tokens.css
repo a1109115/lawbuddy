@@ -1,0 +1,49 @@
+/* ================= 设计令牌（04-设计规范 §2/§3/§4） ================= */
+:root {
+  /* 品牌蓝 */
+  --blue-700: #1d4ed8;
+  --blue-600: #2f6bff;
+  --blue-500: #3d7fff;
+  --blue-100: #e8f0ff;
+  --blue-50: #f0f5ff;
+  /* 墨色（DEV-UI-008：ink-400/ink-300 加深至 WCAG AA ≥4.5:1，ink-600 为正文强调补充） */
+  --ink-900: #16233f;
+  --ink-700: #2a3752;
+  --ink-600: #3d4a63;
+  --ink-500: #55647f;
+  --ink-400: #64718c;
+  --ink-300: #66758c;
+  /* 表面与线条 */
+  --surface: #ffffff;
+  --side-bg: #f1f5fc;
+  --side-line: #e3e9f4;
+  --line: #e6ebf4;
+  --line-strong: #d7e0ef;
+  --bg-app: #dfe6f0;
+  --doc-bg: #dfe6f0;
+  --nav-sel: #e2ebfd;
+  /* 状态（DEV-UI-008：red-500 加深至白底 4.8:1，满足 AA 小字） */
+  --red-500: #d13a24;
+  --red-hover: #e81123;
+  --green-600: #1e7145;
+  --warn-bg: #fffaf0;
+  --warn-line: #f5e3bf;
+  --warn-text: #9a6b15;
+  --mark: #ffe58a;
+  --cite-flash: #dce9ff;
+  /* 圆角 */
+  --radius-sm: 8px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  /* 阴影 */
+  --shadow-card: 0 1px 2px rgba(22, 35, 63, 0.04), 0 4px 16px rgba(22, 35, 63, 0.06);
+  --shadow-card-hover: 0 4px 10px rgba(47, 107, 255, 0.08), 0 12px 28px rgba(22, 35, 63, 0.1);
+  --shadow-dock: 0 2px 6px rgba(22, 35, 63, 0.05), 0 10px 32px rgba(47, 107, 255, 0.12);
+  --shadow-primary: 0 4px 14px rgba(47, 107, 255, 0.35);
+  --shadow-overlay: 0 16px 48px rgba(22, 35, 63, 0.18);
+  /* 字体 */
+  --font-ui: -apple-system, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
+  --font-paper: 'Times New Roman', 'SimSun', '宋体', serif;
+  /* 阅读缩放 */
+  --zoom: 1;
+}

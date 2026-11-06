@@ -1,0 +1,38 @@
+# LawBuddy Python Core 依赖（锁文件在工程初始化后通过 pip-compile / pip freeze 固定）
+pydantic>=2.7
+langgraph>=0.2
+langchain-core>=0.3
+paddlepaddle>=3.0
+paddleocr>=3.0
+pypdf>=4.0
+# PDF 表格重建（O-015 阶段 2）：MIT 许可，纯 Python（pdfminer.six 同源），
+# 仅对检测到线框表格的页做结构重建，无表格页零额外模型/进程开销
+pdfplumber>=0.11
+python-docx>=1.1
+openpyxl>=3.1
+# 导出 PPT（原生可编辑 PPTX 生成，OOXML PresentationML）：MIT/BSD 许可
+python-pptx>=1.0
+# 整库加密（DEC-004 / 技术方案 §14）：SQLCipher 绑定，Windows 提供 cp312 预编译 wheel
+sqlcipher3>=0.6.2
+# 文件级加密与 KDF（技术方案 §14 第 2 条）：AES-256-GCM / HKDF
+cryptography>=42.0
+# 加密 Office 文档解密（REQ-DOC-004：用户密码解密 DOCX/XLSX/PPTX）
+msoffcrypto-tool>=5.4
+# 导出 PDF（DEV-MOD-010 / G-008）：BSD-3 许可；中文使用内置 Adobe CID 字体
+# STSong-Light，不捆绑字体文件，规避中文字体授权问题
+reportlab>=4.0
+# 扫描 PDF 页渲染（05-OCR迁移方案 §3.2）：Apache-2.0；底层 pdfium 为 BSD-3，
+# 同 reportlab 决策先例，符合仓库许可要求
+pypdfium2>=4.0
+# ONNX 引擎（05-OCR迁移方案 §3.3，律阅助手 OnnxOCRClient 配方）：rapidocr 为
+# Apache-2.0，onnxruntime-directml 为 MIT；模型随包内置、免联网。
+# 顺序约束：onnxruntime-directml 必须在 rapidocr_onnxruntime（依赖 CPU 版
+# onnxruntime）之后安装，其模块文件覆盖后者才能启用 DmlExecutionProvider；
+# 二者冲突时以 directml 版为准（CPU EP 同时可用，不影响回退）
+rapidocr_onnxruntime>=1.3
+onnxruntime-directml>=1.16
+# 扫描件表格结构还原（O-015 阶段 4）：RapidTable 为 Apache-2.0，SLANet-plus
+# ONNX 模型（7.4MB，首次构造经 modelscope 下载后离线可用）；仅对表格候选页
+# 追加推理，依赖缺失/模型缺失/内容丢失均静默回退纯 OCR 文本
+rapid-table>=3.0
+
