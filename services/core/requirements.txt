@@ -1,4 +1,12 @@
-# LawBuddy Python Core 依赖（锁文件在工程初始化后通过 pip-compile / pip freeze 固定）
+# LawBuddy Python Core 依赖
+#
+# 当前状态：全部为 >= 下限约束，仓库内尚无锁文件，因此不同时间安装可能得到
+# 不同的版本组合，构建不完全可复现。这一状态已记录在 CONTRIBUTING.md，
+# 计划通过 `pip-compile --generate-hashes` 生成 requirements.lock 并在 CI 中校验。
+#
+# Python 版本：3.12（见仓库根 .python-version；sqlcipher3 在 Windows 仅提供 cp312 预编译 wheel）。
+#
+# 安装顺序约束：见下方 onnxruntime-directml 的说明，直接 `pip install -r` 无法保证该顺序。
 pydantic>=2.7
 langgraph>=0.2
 langchain-core>=0.3

@@ -3,6 +3,16 @@
   "version": "0.1.0",
   "private": true,
   "description": "LawBuddy —— 本地优先的法律 AI 桌面应用",
+  "license": "Apache-2.0",
+  "author": "LawBuddy Authors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/a1109115/lawbuddy.git"
+  },
+  "homepage": "https://github.com/a1109115/lawbuddy#readme",
+  "bugs": {
+    "url": "https://github.com/a1109115/lawbuddy/issues"
+  },
   "workspaces": [
     "apps/*",
     "packages/*"

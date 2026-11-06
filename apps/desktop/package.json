@@ -4,8 +4,17 @@
   "version": "0.1.0",
   "private": true,
   "description": "LawBuddy —— 本地优先的法律 AI 桌面应用",
-  "author": "LawBuddy",
+  "author": "LawBuddy Authors",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/a1109115/lawbuddy.git",
+    "directory": "apps/desktop"
+  },
   "main": "out/main/index.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
