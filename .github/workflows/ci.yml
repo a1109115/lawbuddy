@@ -47,7 +47,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 安装 Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         # 与 .python-version 保持一致：sqlcipher3 仅提供 cp312 wheel
         with:
           python-version-file: .python-version
