@@ -2,6 +2,14 @@
 
 <p align="center"><img src="lawbuddy-mark.png" alt="LawBuddy" width="120"></p>
 
+<p align="center">
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <a href="https://github.com/a1109115/lawbuddy/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/a1109115/lawbuddy"></a>
+  <img alt="Node" src="https://img.shields.io/badge/node-%E2%89%A520-brightgreen">
+  <img alt="Python" src="https://img.shields.io/badge/python-3.12-blue">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey">
+</p>
+
 **LawBuddy** 是一个本地优先（local-first）的法律 AI 桌面应用，面向律师与法务的案卷阅卷、合同审查与法律文书起草场景。案件材料、工作副本与审计记录全部保存在本地加密存储中；AI 能力通过用户自行配置的大模型。
 
 ## 核心功能
@@ -48,8 +56,8 @@
 
 ### 环境要求
 
-- Node.js ≥ 20
-- Python 3.12（`sqlcipher3` 在 Windows 提供 cp312 预编译 wheel）
+- Node.js ≥ 20（精确版本见 `.nvmrc`）
+- Python 3.12（准确版本见 `.python-version`；`sqlcipher3` 在 Windows 提供 cp312 预编译 wheel，**不要用 3.13**）
 - Windows 10/11（密钥环使用 DPAPI；macOS/Linux 需自行适配 Keychain / Secret Service 路径）
 
 ### 安装与启动
@@ -95,6 +103,18 @@ python -m evals.m3_contract
 
 开发约定（含 API Key 管理、法律分析硬性规则与交付前检查清单）见 [AGENTS.md](AGENTS.md)。
 
+## 参与贡献
+
+LawBuddy 目前由个人业余维护，欢迎 Issue 与 Pull Request。
+
+- **动手前请先读** [CONTRIBUTING.md](CONTRIBUTING.md)：分支命名、提交格式、代码约定、安全硬规则、测试要求与提交前检查清单
+- **安全问题请勿公开提 Issue**，按 [SECURITY.md](SECURITY.md) 走私密披露渠道（GitHub Security Advisories）
+- **请勿在 Issue / PR 中粘贴真实案件材料**：当事人姓名、身份证号、案号、合同原文一律不得出现，复现请用虚构样本
+- 参与即表示同意遵守 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+- 本项目是辅助工具，不是法律意见提供者；贡献不得暗示系统输出可直接作为法律意见使用
+
+适合首次贡献的方向：文档补全与示例、Windows/macOS 兼容性验证、界面文案与可访问性改进、评测用例扩充。想动核心逻辑（引用校验、合同审查、文书槽位）建议先开 Issue 讨论方向，避免白做。
+
 ## 目录结构
 
 ```text
@@ -112,3 +132,7 @@ LawBuddy 是辅助工具，不是法律意见提供者。AI 生成的所有分�
 ## 许可证
 
 [Apache-2.0](LICENSE) © 2026 LawBuddy Authors
+
+第三方组件与模型的许可清单见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)，Apache-2.0 §4(d) 要求的声明见 [NOTICE](NOTICE)。
+
+**许可范围说明**：`services/core/seed/skills/@team/case-file-review/references/cause-of-action-wiki/` 下的案由知识库系对第三方出版物的结构化整理，著作权归原作者及出版方所有，其自身声明为「仅供个人学习、研究使用，请勿用于商业目的」，**不适用**上述 Apache-2.0 授权中的商业使用许可。如需在商业场景使用该部分内容，请自行取得权利人授权，或从项目中移除该目录。详见该目录下的 `DISCLAIMER.md`。
