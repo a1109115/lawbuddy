@@ -21,7 +21,7 @@
     "preview": "electron-vite preview",
     "typecheck": "tsc -p tsconfig.node.json --noEmit --composite false && tsc -p tsconfig.web.json --noEmit --composite false",
     "test": "vitest run",
-    "dist": "electron-vite build && electron-builder --win --config electron-builder.yml"
+    "dist": "electron-vite build && node ../../scripts/purge-package-secrets.mjs && node ../../scripts/scan-secrets.mjs && electron-builder --win --config electron-builder.yml"
   },
   "dependencies": {
     "@lawbuddy/contracts": "*",

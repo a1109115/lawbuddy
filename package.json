@@ -27,8 +27,9 @@
     "core:freeze": "cd services\\core && .venv\\Scripts\\python.exe -m PyInstaller --noconfirm --clean --distpath dist_core lawbuddy-core.spec",
     "core:smoke": "cd services\\core && .venv\\Scripts\\python.exe scripts\\_smoke_frozen_encoding.py dist_core && .venv\\Scripts\\python.exe scripts\\_smoke_frozen_core.py dist_core && .venv\\Scripts\\python.exe scripts\\_smoke_frozen_ocr.py dist_core",
     "scan:secrets": "node scripts/scan-secrets.mjs",
+    "purge:secrets": "node scripts/purge-package-secrets.mjs",
     "seed:export": "cd services\\core && .venv\\Scripts\\python.exe scripts\\export_seed.py",
-    "dist:win": "npm run build && npm run core:freeze && npm run seed:export && npm run scan:secrets && npm run dist -w apps/desktop"
+    "dist:win": "npm run build && npm run core:freeze && npm run seed:export && npm run purge:secrets && npm run scan:secrets && npm run dist -w apps/desktop"
   },
   "engines": {
     "node": ">=20"
