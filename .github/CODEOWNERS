@@ -1,0 +1,17 @@
+# 默认负责人。分支保护与必需审查在仓库 Settings → Branches 中配置。
+*                       @a1109115
+
+# 安全与合规文件变更需维护者本人审查
+/SECURITY.md            @a1109115
+/CONTRIBUTING.md        @a1109115
+/CODE_OF_CONDUCT.md     @a1109115
+/.github/               @a1109115
+
+# 加密、密钥、引用校验属高风险区域
+/services/core/lawbuddy/crypto.py       @a1109115
+/services/core/lawbuddy/keyring.py      @a1109115
+/services/core/lawbuddy/security.py     @a1109115
+/services/core/lawbuddy/citations.py    @a1109115
+/services/core/lawbuddy/sandbox.py      @a1109115
+/apps/desktop/src/main/                 @a1109115
+/apps/desktop/src/preload/              @a1109115

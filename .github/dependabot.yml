@@ -1,0 +1,39 @@
+version: 2
+
+updates:
+  # 前端依赖（npm workspaces，锁文件在仓库根）
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    groups:
+      # 补丁与次版本合并成一个 PR，减少噪音；主版本仍然单独提
+      npm-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+
+  # GitHub Actions 版本
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci(deps)"
+    labels:
+      - dependencies
+      - ci
+
+  # 说明：pip 生态暂未纳入自动更新。
+  # services/core/requirements.txt 目前使用 >= 下限约束、无锁文件，
+  # Dependabot 无法给出有意义的版本升降建议。待引入 requirements.lock 后再开启。

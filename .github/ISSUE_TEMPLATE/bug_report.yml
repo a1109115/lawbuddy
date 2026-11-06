@@ -1,0 +1,106 @@
+name: 缺陷报告
+description: 报告可复现的功能异常（安全问题请改用私密渠道）
+title: "[Bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 提交前请确认
+
+        - 已搜索现有 Issue，未找到同类问题
+        - **这不是安全漏洞**。涉及密钥泄露、路径逃逸、解密绕过、Prompt 注入的，请按 [SECURITY.md](../blob/main/SECURITY.md) 走私密披露，不要在这里填写
+        - 已移除所有**真实案件信息**：当事人姓名、身份证号、案号、法院名称、合同原文。请改用虚构样本复现
+
+        > 本项目是辅助工具，不是法律意见提供者。请勿在 Issue 中请求对具体案件给出结论。
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 问题描述
+      description: 发生了什么？你期望发生什么？
+      placeholder: |
+        实际行为：
+        期望行为：
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 请给出最小可复现步骤。若涉及具体文档，请说明文档类型与页数，不要上传原件。
+      placeholder: |
+        1. 新建案件 → 导入 3 页扫描件 PDF
+        2. 在阅卷模式输入 "..."
+        3. 观察到 ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: LawBuddy 版本或提交哈希
+      description: 安装包版本号，或源码运行时的 `git rev-parse --short HEAD`
+      placeholder: "0.1.0 / 86919d1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS（实验性）
+        - Linux（实验性）
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 涉及的模块
+      multiple: true
+      options:
+        - 案卷阅卷 / Agent Loop
+        - 引用与证据门禁（Claim Ledger）
+        - 合同审查
+        - 法律文书生成
+        - 在线编辑与预览导出
+        - OCR / 表格还原
+        - 加密存储 / 备份
+        - API Key 与设置
+        - 桌面端界面
+        - 其他
+    validations:
+      required: true
+
+  - type: input
+    id: provider
+    attributes:
+      label: 模型服务商（可选）
+      description: 仅填写服务商名称（DeepSeek / 智谱 / 百炼 / Kimi / 自定义）。**绝对不要填写 API Key。**
+      placeholder: "DeepSeek"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 错误日志或截图
+      description: |
+        请先确认日志中不含案件原文、当事人信息、密钥。
+        审计日志可导出，但请检查后再粘贴。
+      render: shell
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 自查
+      options:
+        - label: 我已移除所有真实案件信息与个人信息
+          required: true
+        - label: 我确认这不是安全漏洞（或已改走私密渠道）
+          required: true
+        - label: 我已搜索过现有 Issue
+          required: true

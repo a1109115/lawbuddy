@@ -1,0 +1,64 @@
+name: 功能建议
+description: 提出新功能或改进现有行为
+title: "[Feature] "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 提交前请确认
+
+        - 已搜索现有 Issue 与 PR，未找到相同建议
+        - 建议符合本项目的**本地优先**原则：不引入"必须联网才能工作"的依赖，不新增未经审批的数据外发
+        - 你不要求系统直接给出法律意见 —— 本项目的设计前提是"结论必须有原文出处并可回溯"
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你遇到的实际问题
+      description: 描述场景与痛点，而不是先给方案。说明你是什么角色（律师 / 法务 / 开发者 / 其他）与典型任务。
+      placeholder: |
+        我在批量阅卷时，需要把 20 份证据按时间线排序，目前只能逐个打开……
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你期望的方案
+      description: 描述期望的交互或行为。若涉及结论输出，请说明它如何满足"可回溯原文"的要求。
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 你考虑过的替代方案
+      description: 现有功能能否绕过？其他工具如何解决？
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 涉及模块
+      multiple: true
+      options:
+        - 案卷阅卷 / Agent Loop
+        - 引用与证据门禁（Claim Ledger）
+        - 合同审查
+        - 法律文书生成
+        - 在线编辑与预览导出
+        - OCR / 表格还原
+        - 加密存储 / 备份
+        - 技能（Skills）系统
+        - 桌面端界面
+        - 开发者体验 / 文档
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: 约束确认
+      options:
+        - label: 该建议可以在完全离线的情况下工作（或明确说明为何必须联网）
+          required: true
+        - label: 该建议不要求降低现有的加密、脱敏或审批机制
+          required: true
