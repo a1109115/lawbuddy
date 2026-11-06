@@ -14,9 +14,11 @@ __pycache__/
 .trae-html-share-packages/
 .DS_Store
 # 案件材料与诉讼文书（敏感，不上传）
+# 使用通用规则而非具名文件：具名规则会把本地存在哪些材料的线索连同仓库一起公开。
 case_file/
-79号法院诉讼文书 (2).pdf
-法律分析建议书_*.docx
+case_file*/
+/*.pdf
+/*.docx
 ~$*.docx
 # 密钥载荷与本地大模型权重（构建时生成/运行时下载，不入库；离线表格模型除外）
 services/core/models/*
@@ -41,7 +43,6 @@ lawbuddy-open-source/
 body.html
 lawbuddy.png
 lawbuddy头像.png
-skills-lock.json
 # 环境变量与本地密钥配置（永不入库）
 .env
 .env.*
