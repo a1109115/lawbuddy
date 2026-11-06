@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: 前端类型检查与单测
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+        env:
+          # 类型检查与 jsdom 单测都不需要 Electron 二进制，跳过下载可省约 100 MB
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+
+      - name: 类型检查（主进程 + 渲染层）
+        run: npm run typecheck
+
+      - name: 单元测试（Vitest）
+        run: npm run test
+
+  python:
+    name: Python 语法与静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        # 与 .python-version 保持一致：sqlcipher3 仅提供 cp312 wheel
+        with:
+          python-version-file: .python-version
+
+      - name: 安装 ruff
+        run: pip install ruff==0.8.4
+
+      # 说明：本 job 有意不安装 requirements.txt。
+      # paddlepaddle / onnxruntime-directml 体积达数 GB 且依赖 GPU 运行时，
+      # 不适配 GitHub 托管 runner。这里只做「能 import、无语法错误、无未定义名」的最低门槛，
+      # 完整评测由贡献者在本地执行并在 PR 中贴结果（见 CONTRIBUTING.md 第 6 节）。
+      - name: ruff 静态检查
+        run: ruff check services/core
+
+      - name: 字节码编译（语法检查）
+        run: python -m compileall -q services/core
+
+  secret-scan:
+    name: 密钥扫描门禁
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: 扫描源码、种子资源与构建产物
+        # scan-secrets.mjs 要求 apps/desktop/out 存在（打包链路中在 build 之后执行）。
+        # CI 不构建 Electron 产物，这里建空目录，仅扫 Python 源码与 seed 资源。
+        run: |
+          mkdir -p apps/desktop/out
+          node scripts/scan-secrets.mjs

@@ -1,0 +1,76 @@
+name: Release (Windows)
+
+# 手动触发。完整打包链路涉及 PyInstaller 冻结、PaddleOCR / ONNX 模型与
+# electron-builder NSIS 打包，依赖体积达数 GB、耗时较长，且首次运行可能
+# 需要按环境调整，因此不挂自动触发，避免 tag 一推就红。
+#
+# 里程碑：签名与自动更新尚未实现（见 README 路线），本 workflow 产出未签名安装包。
+#
+# 本地等价命令（见 package.json）：
+#   npm run dist:win
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 版本号（仅用于产物命名，需与 package.json 一致才会生效）
+        required: true
+        default: 0.1.0
+
+permissions:
+  contents: read
+
+jobs:
+  build-win:
+    name: 构建 Windows 安装包
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: 准备 Python Core 虚拟环境
+        shell: pwsh
+        run: |
+          cd services/core
+          python -m venv .venv
+          .venv\Scripts\python.exe -m pip install --upgrade pip
+          .venv\Scripts\pip.exe install -r requirements.txt
+
+      - name: 构建（build → core:freeze → seed:export → scan:secrets → dist）
+        shell: pwsh
+        run: npm run dist:win
+
+      - name: 生成校验和
+        shell: pwsh
+        run: |
+          Get-ChildItem apps/desktop/release/*.exe | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+            "$h  $($_.Name)" | Out-File -Append -Encoding utf8 SHA256SUMS.txt
+          }
+          Get-Content SHA256SUMS.txt
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: lawbuddy-windows-${{ inputs.version }}
+          path: |
+            apps/desktop/release/*.exe
+            SHA256SUMS.txt
+          retention-days: 30
+
+      # 发布到 Release 需要 contents: write 与签名证书，当前未配置。
+      # 发布流程暂为：下载 artifact → 手动创建 Release → 上传安装包与 SHA256SUMS.txt。
