@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -34,22 +35,29 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import model_gateway, tasks as task_store
+from . import tool_registry
 
 # 循环硬限制之一：最大对话轮数（每轮 = 一次模型调用 + 若干工具执行）。
-# 固定值，不按任务深度/语料规模动态调整——避免同类任务因提示词措辞不同
-# （如「搜索类案信息」未被识别为 full_review）拿到不同轮数预算。
-MAX_ROUNDS = 200
+# 默认值按「大卷宗批量作业」留足余量：单份材料几十页、卷宗上百份时，
+# 逐份定向检索 + 精读很容易超过两百轮，旧默认 200 会让任务在收尾前被截断。
+# 需要更紧/更松时用环境变量覆盖，不改代码即可适配不同机器与模型。
+MAX_ROUNDS = max(1, int(os.environ.get("LAWBUDDY_MAX_ROUNDS") or 600))
 # 循环硬限制之二：单次任务累计工具调用次数（跨轮累加，单个 tool_call 计一次）。
 # 轮数与工具调用数是两个独立维度——一轮可并发多次工具调用，只卡轮数会让
 # 少数轮次堆积大量调用；只卡调用数则会让模型空转轮数。两者同时生效。
-MAX_TOOL_CALLS = 500
+# 取值需覆盖「按页读完整个卷宗」的下限：N 页 / 单次可读页数。
+MAX_TOOL_CALLS = max(1, int(os.environ.get("LAWBUDDY_MAX_TOOL_CALLS") or 2400))
+
+# 检索缓存索引版本（B-02 §4.7）：FTS 结构或分词规则变化时递增，
+# 使旧检索缓存整体失效，避免把旧索引结果当成当前语料命中。
+SEARCH_INDEX_VERSION = "v1"
 
 # 传输优化参数（不影响模型自主性）
 TEXT_FLUSH_INTERVAL_S = 0.25          # text 增量节流推送间隔
-PAGE_TEXT_LIMIT = 2400                # 读原文时单页单次回灌上限（字符），超出部分用游标续读
-TOTAL_PAGE_READ_CHARS = 6000          # 单次 document_get_pages 原文总量上限，须低于工具结果回灌上限
+PAGE_TEXT_LIMIT = 6000                # 读原文时单页单次回灌上限（字符），超出部分用游标续读
+TOTAL_PAGE_READ_CHARS = 16000         # 单次 document_get_pages 原文总量上限，须低于工具结果回灌上限
 _PAGE_ENTRY_OVERHEAD = 120            # 单页条目的元数据（页码/质量/游标字段）预留字符
-TOOL_RESULT_CHAR_LIMIT = 8000         # 单个工具结果回灌上下文的上限（字符）
+TOOL_RESULT_CHAR_LIMIT = 24000        # 单个工具结果回灌上下文的上限（字符）
 MAX_RISK_ITEMS = 40                   # 单次审查落库的风险项上限（与旧管线 MAX_CONTRACT_CLAIMS 一致）
 
 # 检索子代理（case_explore，Trae Search Agent 对应物）：按问题定向查证，
@@ -69,16 +77,43 @@ FINALIZE_REPAIR_ROUNDS = 2            # 最多两轮守门修复（每轮复用�
 FINALIZE_COVERAGE_REPAIR_PAGES = 6    # 覆盖缺口少于此页数时才值得发起精准补读
 FINALIZE_MAX_REPAIRS = 8              # 单次守门最多下发的修复项数（超出部分直接进警告）
 
-# 阅读账本条目上限（大卷宗只保最近读取状态，防止 checkpoint 无限膨胀）
+# 阅读账本条目上限：已取消容量淘汰（LB-HARNESS-2026-01 §1.1 第 4 条）。
+# 保留常量只为兼容既有引用；不再用于裁剪账本。
 READING_LEDGER_MAX_ENTRIES = 600
 
 # 证据/争点账本（05 方案 §5.5 §5.6）：跨轮次、跨压缩、跨子代理的精确证据状态。
 # 只保存必要字段与增量，不把原文全文复制进每轮 Prompt；摘要按需注入（§6.4）。
+# 同样不按容量淘汰（证据/争点淘汰会让收尾守门失去依据）；常量仅为兼容保留。
 EVIDENCE_LEDGER_MAX_ENTRIES = 240
 ISSUE_LEDGER_MAX_ENTRIES = 40
 LEDGER_SUMMARY_CHARS = 900           # 每轮注入的状态摘要上限（动态段保持小）
 # 一次任务内所有检索子代理共享的模型轮次预算（§6.5 共享总预算）
 EXPLORE_TOTAL_ROUND_BUDGET = 16
+
+# 自主任务的预算换算基准（B-02 §4.4 统一预算）：默认 DEFAULT_LIMITS 面向
+# 「一个短会话」，而自主阅卷是「整卷多轮作业」，模型调用/墙钟/Token 必须按
+# 轮次量级放大，否则刚开工就会被判 blocked。这里给的是每轮保守上限，
+# 用于从 MAX_ROUNDS 推导出与轮次同量级的预算，真实用量仍由记账决定。
+AUTONOMOUS_SECONDS_PER_ROUND = 120
+AUTONOMOUS_TOKENS_PER_ROUND = 40_000
+
+# 交付物周期回写（WFA-LAW 优化方案 §4.2 / P0-04）：长任务必须边分析边落盘。
+# 每 N 轮注入一条轻量提示，提醒把已确认结论合并写回 submission/，避免预算
+# 耗尽时零产出；提示本身不改变模型自主性（是否回写、写什么仍由模型决定）。
+DELIVERABLE_PATCH_INTERVAL = max(1, int(os.environ.get("LAWBUDDY_DELIVERABLE_INTERVAL") or 10))
+# 收尾模式的提示频率：收尾期剩余轮数不多，按更短间隔反复提醒回写
+WRAP_UP_HINT_INTERVAL = 3
+# 长输出断连续写上限（P2-10 §4.7）：单轮最多续写 2 次，避免断网时无限重试
+MAX_RESUME_ATTEMPTS = 2
+# 预算临近耗尽的收尾阈值：剩余轮数/调用数低于该比例时进入收尾模式
+WRAP_UP_ROUND_RATIO = 0.15
+WRAP_UP_MIN_ROUNDS = 12
+# 单次 work_unit_run 最多派发的工作单元数（B-04）：超过时应分批推进，
+# 避免一次工具调用把并发与上下文同时打满
+MAX_WORK_UNITS_PER_CALL = 4
+# 工具参数断连的整轮重试上限（HAR-T-009）：不完整参数一律丢弃重来，
+# 连续失败则按异常上抛（由外层决定任务状态），不产生静默空批次
+MAX_PARTIAL_CALL_RETRIES = 2
 
 # 沙箱工作空间工具名集合（实现见 sandbox.py；bash 需用户逐次审批）
 _SANDBOX_TOOLS = {"read_file", "write_file", "edit_file", "glob_files", "grep_search", "bash", "render_html", "render_pptx"}
@@ -86,18 +121,49 @@ _SANDBOX_TOOLS = {"read_file", "write_file", "edit_file", "glob_files", "grep_se
 # 渲染类只在本次交付要点名出图/演示时下发——普通阅卷不承担这些无关工具的固定 token 开销。
 _WORKSPACE_TOOLS = {"read_file", "write_file", "edit_file", "glob_files", "grep_search", "bash"}
 _RENDER_TOOLS = {"render_html", "render_pptx"}
+# 交付回写工具（P0-04）：只要本次任务声明了交付契约就下发，不依赖工作空间关键词。
+# work_unit_run（B-04）同理：只有声明了交付契约（存在工作全集）时才有意义。
+_DELIVERABLE_TOOLS = {"deliverable_patch", "work_unit_run"}
+# 收尾模式下禁止的工具（P0-04 第 3 条）：只阻断"新开检索/整卷阅读"这类
+# 会继续消耗预算的探查动作；回写交付物、产出结论与产物渲染不受影响。
+_WRAP_UP_BLOCKED_TOOLS = {
+    "document_search", "document_get_pages", "case_explore", "work_unit_run",
+    "grep_search", "read_file", "glob_files",
+}
+# 同族条款消歧工具（P1-08）：命中成对定义关键词时下发
+_ROLE_TOOLS = {"clause_role_check"}
+# 多选逐项核对工具（P2-09）：命中多选/全量列举判据时下发
+_OPTION_TOOLS = {"options_check"}
+# 长输出合并校验工具（P2-10）：声明的交付物是多实体结构时下发
+_MERGE_TOOLS = {"merge_fragments_check"}
+# 多实体长输出的判据（P2-10）：请求里点名被告/当事人数量，或交付契约声明了实体主键
+_MULTI_ENTITY_KEYWORDS = (
+    "被告", "被告人", "被告单位", "当事人", "上诉人", "被上诉人",
+    "defendant", "suspect", "judgment", "判决书",
+)
+_ROLE_DISAMBIGUATION_KEYWORDS = (
+    "material adverse", "mae", "mac", "重大不利", "target", "parent", "buyer",
+    "company material", "收购方", "目标公司", "目标方",
+)
+# 多选/全量列举的判据（P2-09）
+_OPTION_CHECK_KEYWORDS = (
+    "多选", "全部", "所有", "哪些", "逐一", "list all", "which of", "select all",
+    "多选题", "勾选", "满足条件的",
+)
 
 # ---------------------------------------------------------------------------
 # 上下文窗口管理：历史压缩 + 工具裁剪 + 会话级任务清单（harness 优化三件套）
 # ---------------------------------------------------------------------------
 
-# 历史压缩触发阈值（字符，中文 ≈1.2 token/字）：≈10.8 万 token。历史消息
-# 无限累积曾使 32 轮后期每轮 prompt 达十几万 token（TTFT 实测 >30s）；
-# 超过阈值即把早期轮次压缩为一条摘要消息，system + 最近轮次原样保留
-CONTEXT_COMPACT_THRESHOLD_CHARS = 90_000
+# 历史压缩触发阈值（字符，中文 ≈1.2 token/字）。历史消息无限累积曾使 32 轮
+# 后期每轮 prompt 达十几万 token（TTFT 实测 >30s）；超过阈值即把早期轮次压缩
+# 为一条摘要消息，system + 最近轮次原样保留。默认按 131K 上下文窗口取约四成
+# 体积，给模型输出、工具 schema 与状态摘要留出余量。
+CONTEXT_COMPACT_THRESHOLD_CHARS = int(
+    os.environ.get("LAWBUDDY_CONTEXT_COMPACT_CHARS") or 340_000)
 # 压缩时原样保留的最近消息条数（从尾部向前取，起点回退到 assistant 消息
 # 以保持 tool 消息与其 tool_calls 父消息的配对完整）
-CONTEXT_KEEP_RECENT_MSGS = 8
+CONTEXT_KEEP_RECENT_MSGS = int(os.environ.get("LAWBUDDY_CONTEXT_KEEP_MSGS") or 24)
 
 # 任务清单注入 system prompt 的分隔标记（续跑时据此剥离旧清单段还原基础提示）
 _PLAN_MARK = "\n\n【当前任务清单】"
@@ -120,6 +186,7 @@ _MODE_TOOLS: dict[str, set[str]] = {
     "document_generation": {
         "documents_list", "document_search", "document_get_pages",
         "memory_search", "memory_write", "case_explore", "case_ledger",
+        "work_unit_run",
         "docgen_list_templates", "docgen_create_draft",
         "docgen_render_draft",
         "docgen_get_draft", "docgen_revise_draft",
@@ -130,7 +197,10 @@ _MODE_TOOLS: dict[str, set[str]] = {
 # 各模式通用：任务清单与「已安装技能」只读列举。
 # 列举类工具不改变任何状态、Schema 极小，但缺了它模型无法自查本机能力，
 # 容易把「列表为空」误答成「没有该能力」；安装/卸载技能仍在 _INSTALL_TOOLS 里按关键词下发。
-_COMMON_TOOLS = {"task_plan", "skill_list"}
+_COMMON_TOOLS = {"task_plan", "skill_list", "table_aggregate",
+                 "tool_search", "tool_describe", "tool_call", "tool_batch"}
+# 工具发现类：渐进披露开启时始终直接下发（否则模型无从发现其余工具）
+_DISCOVERY_TOOLS = {"tool_search", "tool_describe", "tool_call", "tool_batch"}
 # 安装/管理类一次性流程工具：仅在用户请求明确涉及时下发
 _INSTALL_TOOLS = {
     "skill_install", "skill_list", "skill_remove",
@@ -204,6 +274,95 @@ def _wants_presentation(state: dict[str, Any]) -> bool:
     return str(contract.get("taskDepth") or "") in ("focused", "full_review")
 
 
+def _needs_role_disambiguation(state: dict[str, Any]) -> bool:
+    """本次任务是否可能涉及同族条款消歧（P1-08）。
+
+    判据：请求或合同上下文出现成对定义的中心术语，或明确比较目标方/收购方。
+    只在命中时注入提示与工具，普通单点问答不承担这段开销。
+    """
+    text = " ".join([
+        str(state.get("request") or ""),
+        str((state.get("contract_input") or {}).get("transactionGoal") or ""),
+    ]).lower()
+    return any(k in text for k in _ROLE_DISAMBIGUATION_KEYWORDS)
+
+
+def _needs_option_check(state: dict[str, Any]) -> bool:
+    """本次任务是否需要多选逐项核对（P2-09）。
+
+    判据：交付契约里有声明为多选的字段，或请求本身要求"列出全部/哪些/多选"，
+    或任务属于跨文档聚合（聚合题几乎都带多选题）。
+    """
+    for spec in _deliverable_specs(state):
+        multi = spec.get("multi") or spec.get("multiPoints")
+        if isinstance(multi, (list, dict)) and multi:
+            return True
+        for q in spec.get("questions") or []:
+            if isinstance(q, dict) and q.get("multi"):
+                return True
+    text = str(state.get("request") or "")
+    if any(k in text for k in _OPTION_CHECK_KEYWORDS):
+        return True
+    # 不能在这里调 _exposed_tool_names：工具裁剪本身会回调本函数（无限递归）。
+    # 直接看"是否存在结构化聚合输入"这一等价判据即可。
+    return bool(state.get("deliverable_questions") or state.get("multi_points"))
+
+
+def _needs_batched_output(state: dict[str, Any]) -> bool:
+    """本次任务是否需要长输出分批与合并校验（P2-10）。
+
+    判据：请求点名多实体输出（被告/当事人/判决书），或交付契约声明了实体主键
+    （itemKey / key）且实体数量明显大于单批容量。
+    """
+    from .. import long_output
+
+    request = str(state.get("request") or "")
+    if any(k in request.lower() for k in _MULTI_ENTITY_KEYWORDS):
+        return True
+    expected = _expected_entities(state, request)
+    if expected is None:
+        return False
+    return len(expected) > long_output.DEFAULT_ITEMS_PER_BATCH
+
+
+def _expected_entities(state: dict[str, Any], request: str | None = None) -> list[str] | None:
+    """期望实体主键列表：优先取任务显式声明，其次从请求里识别数量（生成占位键）。
+
+    显式声明来自 deliverables[].expectedEntities（案件已确定被告名单时由 UI 传入）；
+    只有数量时返回占位键（"1".."N"），用于"数量是否齐全"这一层校验。
+    """
+    from .. import long_output
+
+    for spec in _deliverable_specs(state):
+        declared = spec.get("expectedEntities")
+        if isinstance(declared, list) and declared:
+            return [str(x) for x in declared]
+    count = long_output.detect_entity_count(request if request is not None else str(state.get("request") or ""))
+    if count:
+        return [str(i) for i in range(1, count + 1)]
+    return None
+
+
+def _batched_output_hint(state: dict[str, Any]) -> str:
+    """长输出分批提示（P2-10 第 1 条）：只在多实体任务注入。"""
+    from .. import long_output
+
+    request = str(state.get("request") or "")
+    count = long_output.detect_entity_count(request)
+    if not count:
+        expected = _expected_entities(state, request)
+        count = len(expected) if expected else 0
+    if count <= long_output.DEFAULT_ITEMS_PER_BATCH:
+        return ""
+    hint = long_output.batch_hint(count)
+    # 合并后必须自检，避免分批间口径漂移（R6）
+    return hint + (
+        "\n每批写完后若实体数 ≥2，用 merge_fragments_check 对已落盘的多批内容做合并校验："
+        "它会检查主键是否齐全/重复、roles 与 charges 键是否一致；"
+        "发现缺项或口径不一致时先补齐再回写，不要整份重写。"
+    )
+
+
 def _exposed_tool_names(state: dict[str, Any]) -> set[str] | None:
     """本次任务实际下发的工具名集合；None 表示模式未登记、全量下发。"""
     allow = _MODE_TOOLS.get(str(state.get("mode") or ""))
@@ -214,6 +373,19 @@ def _exposed_tool_names(state: dict[str, Any]) -> set[str] | None:
         names |= _WORKSPACE_TOOLS
     if _wants_render(state):
         names |= _RENDER_TOOLS
+    # 交付契约存在时下发回写工具（P0-04）：与工作空间关键词无关，
+    # 否则「请输出 deal_points.csv」这类任务拿不到回写通道
+    if state.get("deliverables"):
+        names |= _DELIVERABLE_TOOLS
+    # 同族条款消歧（P1-08）：命中成对定义关键词时下发校验工具
+    if _needs_role_disambiguation(state):
+        names |= _ROLE_TOOLS
+    # 多选逐项核对（P2-09）：命中多选判据时下发核对工具
+    if _needs_option_check(state):
+        names |= _OPTION_TOOLS
+    # 长输出分批（P2-10）：多实体任务下发合并校验工具
+    if _needs_batched_output(state):
+        names |= _MERGE_TOOLS
     if (state.get("contract_input") or {}).get("workflowKind") == "contract_dialogue":
         # Dialogue may inspect sources, but cannot overwrite confirmed workflow artifacts.
         names = names - {"contract_create_review", "contract_split_clauses", "memory_write",
@@ -224,17 +396,41 @@ def _exposed_tool_names(state: dict[str, Any]) -> set[str] | None:
 
 
 def _tools_for(state: dict[str, Any]) -> list[dict[str, Any]]:
-    """按任务与交付需求下发工具子集（§6.6 D2）。
+    """按任务与交付需求下发工具子集（§6.6 D2 / WP06）。
 
     命中已知模式时只保留该模式相关 + 通用工具；沙箱文件/命令工具与渲染工具
     按本次请求的实际需要追加；用户请求涉及安装流程（MCP/技能）时补充安装类工具。
     未登记模式全量下发（行为保守）。
+
+    `agent.toolSearch` 开启时，只把**高频/核心**工具直接下发 Schema，其余经
+    `tool_search` 检索后用 `tool_call` 调用（渐进披露）。默认关闭，保持既有行为。
     """
     specs = _tool_specs()
     names = _exposed_tool_names(state)
     if names is None:
         return specs
+    if _setting_bool("agent.toolSearch", False):
+        names = {n for n in names if tool_registry.get(n).eager or n in _DISCOVERY_TOOLS}
     return [s for s in specs if s["function"]["name"] in names]
+
+
+def _allowed_tool_names(state: dict[str, Any]) -> set[str]:
+    """当前任务**有权调用**的全部工具名（含未直接下发的低频工具）。
+
+    Tool Search / tool_describe / tool_call 的权限判定都用这一个集合：
+    它等于「模式策略 + 案件/交付过滤」后的结果，因此检索结果与可调用范围一致，
+    不会出现"搜得到但调不动"或"调得动但搜不到"。`None`（未登记模式全量下发）
+    视为全部工具可用。
+    """
+    names = _exposed_tool_names(state)
+    if names is None:
+        return {str(s["function"]["name"]) for s in _tool_specs()}
+    return set(names)
+
+
+def _eager_tool_names(state: dict[str, Any]) -> set[str]:
+    """当前实际直接下发 Schema 的工具名（其余需经 tool_search + tool_call）。"""
+    return {str(s["function"]["name"]) for s in _tools_for(state)}
 
 
 # 推理档位分阶段（§6.6 第 5 条 / §10.4 D3）：同一任务不同阶段的思考强度应当不同。
@@ -363,6 +559,88 @@ _PLAN_DONE_VALUES = {"done", "completed", "complete", "finished", "已完成", "
 def _plan_is_done(status: Any) -> bool:
     """步骤是否已完成（兼容模型输出的中英文同义词）。"""
     return str(status or "").strip().lower() in _PLAN_DONE_VALUES
+
+
+def _gate_feedback(state: dict[str, Any], exc: BaseException | None) -> None:
+    """把一次模型调用结果反馈给并发闸门（B-04）。
+
+    exc 为 None 表示成功；否则按 429 / 超时 / 断连分类降并发。闸门只维护计数，
+    不记录任何案件内容；异常分类失败也不影响主循环。
+    """
+    try:
+        from . import concurrency
+
+        gate = concurrency.gate()
+        if exc is None:
+            gate.on_success()
+        else:
+            gate.on_failure(concurrency.classify_error(exc))
+    except Exception:  # noqa: BLE001 闸门反馈失败不影响任务
+        return
+
+
+def _emit_budget_update(state: dict[str, Any], emit: Callable[..., None]) -> None:
+    """预算阶段变化时推送 `budget_update`（B-05）：只在阶段/原因变化时发。
+
+    每轮都发会让事件表膨胀几十倍；这里用 state 缓存上次阶段做去重。
+    """
+    task_id = str(state.get("task_id") or "")
+    if not task_id:
+        return
+    try:
+        from . import budget
+
+        snap = budget.snapshot(task_id)
+    except Exception:  # noqa: BLE001 预算不可用时不发事件
+        return
+    signature = (snap.get("stage"), tuple(snap.get("reasons") or []))
+    if state.get("_budget_signature") == signature:
+        return
+    state["_budget_signature"] = signature
+    emit("budget_update", {
+        "stage": snap.get("stage"),
+        "used": budget.public_used(snap.get("used")),
+        "limits": snap.get("limits") or {},
+        "reasons": list(snap.get("reasons") or []),
+        "deliveryReservedRounds": int(state.get("_delivery_reserved") or 0),
+    })
+
+
+def _compose_system(
+    message: dict[str, Any], state: dict[str, Any], base_system: str,
+) -> str:
+    """每轮 system 组装（B-04）：稳定前缀 + 任务清单 + 账本摘要 + 工作单元简报。
+
+    - 稳定前缀逐字不变（`context_builder.build_stable_prefix`），便于模型侧前缀缓存；
+    - 任务清单与账本摘要每轮重建，数据来自 state 与数据库，不依赖历史摘要；
+    - 存在工作全集且调度器已选出当前单元时，追加上下文简报（合法选项、失败原因、
+      相关证据），使模型聚焦单一单元而不是整卷内容。
+    任何一段出错都降级为上一轮内容，不让任务因为组装失败中断。
+    """
+    try:
+        from . import context_builder
+
+        prefix = context_builder.build_stable_prefix(state, base_system)
+        parts = [prefix, _plan_section(state.get("task_plan")), _ledger_summary(state)]
+        state_block = context_builder.build_state_block(state)
+        if state_block:
+            parts.append(state_block)
+        unit = _current_unit(state)
+        if unit is not None:
+            parts.append(context_builder.build_unit_brief(state, unit))
+        return "".join(parts)
+    except Exception:  # noqa: BLE001 组装失败退回上一轮内容
+        return str(message.get("content") or "")
+
+
+def _current_unit(state: dict[str, Any]) -> dict[str, Any] | None:
+    """当前工作单元：最近一次 work_unit_run 正在处理的单元（无则 None）。
+
+    不在这里做调度查询——调度会读库，system 组装每轮都会执行，避免额外开销。
+    单元信息由 work_unit_run 在派发时写入 state。
+    """
+    unit = state.get("_current_unit")
+    return unit if isinstance(unit, dict) else None
 
 
 def _plan_section(plan: list[dict[str, Any]] | None) -> str:
@@ -623,9 +901,9 @@ def _record_reading_locked(
             done = covered_end >= total and not page.get("truncated")
             entry["state"] = "read_complete" if done else "read_partial"
         ledger[key] = entry
-    if len(ledger) > READING_LEDGER_MAX_ENTRIES:
-        for stale_key in list(ledger)[: len(ledger) - READING_LEDGER_MAX_ENTRIES]:
-            ledger.pop(stale_key, None)
+    # 不再按固定容量淘汰（LB-HARNESS-2026-01 §1.1 第 4 条）：1,865 页以上的卷宗
+    # 若淘汰早期页面记录，收尾覆盖校验会把已读页误判为未读，工作状态也不再可信。
+    # 单条记录只有页码、版本、覆盖区间与轮次，规模随页数线性增长，可接受。
 
 
 def _reading_coverage(state: dict[str, Any], contract: dict[str, Any]) -> dict[str, Any]:
@@ -768,7 +1046,7 @@ _ISSUE_STATUSES = ("open", "ready_to_synthesize", "needs_human")
 # ---------------------------------------------------------------------------
 
 def _efficiency(state: dict[str, Any]) -> dict[str, Any]:
-    """任务内效率计数器（只在内存累计，不进检查点：它度量的是本次运行行为）。"""
+    """任务内效率计数器（检查点只持久化累计计数，缓存仍只在本进程内）。"""
     with _LEDGER_LOCK:
         eff = state.get("_efficiency")
         if not isinstance(eff, dict):
@@ -800,21 +1078,28 @@ def _count_tool_call(state: dict[str, Any], name: str) -> None:
 def _cached_term_hits(
     state: dict[str, Any], term: str, origin: str,
     fetch: Callable[[], list[dict[str, Any]]],
+    *, scope: str = "",
 ) -> tuple[list[dict[str, Any]], bool]:
-    """单个检索词的缓存与记账，返回 (hits, 是否命中缓存)。"""
+    """单个检索词的缓存与记账，返回 (hits, 是否命中缓存)。
+
+    缓存键必须带**检索范围**（案件 + 文档集合 + 文档版本）：同词不同
+    `documentIds` 的结果不同，只按词缓存会把 A 范围的命中串用到 B 范围
+    （HAR-T-003）。范围由调用方传入的 scope 前缀承担。
+    """
     eff = _efficiency(state)
     key = " ".join(str(term or "").split())
+    scoped = f"{scope}\x00{key}" if scope else key
     with _LEDGER_LOCK:
         eff["searches"] += 1
         eff["searchesByOrigin"][origin] = int(eff["searchesByOrigin"].get(origin) or 0) + 1
-        cached = eff["searchCache"].get(key)
+        cached = eff["searchCache"].get(scoped)
     if cached is not None:
         with _LEDGER_LOCK:
             eff["duplicateSearches"] += 1
         return cached, True
     hits = fetch()
     with _LEDGER_LOCK:
-        eff["searchCache"][key] = hits
+        eff["searchCache"][scoped] = hits
         for hit in hits:
             eff["hitPages"].add((str(hit.get("documentId") or ""), int(hit.get("pageNo") or 0)))
         if not hits:
@@ -822,9 +1107,108 @@ def _cached_term_hits(
     return hits, False
 
 
+def _search_scope(state: dict[str, Any], document_ids: tuple[str, ...] = ()) -> str:
+    """检索范围键：案件 + 文档集合 + 语料版本戳 + 索引版本。
+
+    版本戳在每次运行开始时按活动版本重建（`_corpus_stamp`），文档换版后旧缓存
+    自然失效，不会把旧版本命中当成已支持事实（HAR-T-012）。索引版本用于在
+    FTS 结构/分词规则变化时整体失效旧缓存。不在此处查库，避免每次检索都做一次
+    文档元数据查询。
+    """
+    case_id = str(state.get("case_id") or "")
+    docs = ",".join(sorted(str(d) for d in document_ids if str(d)))
+    stamp = str(state.get("_corpus_stamp") or "")
+    return f"{case_id}|{docs or '*'}|{stamp}|{SEARCH_INDEX_VERSION}"
+
+
+def _corpus_stamp(state: dict[str, Any]) -> str:
+    """当前语料版本戳：文档 id + 活动版本 id 的稳定哈希（不含标题与正文）。"""
+    import hashlib
+
+    from .. import documents
+
+    case_id = str(state.get("case_id") or "")
+    try:
+        docs = documents.list_task_documents(case_id)
+    except Exception:  # noqa: BLE001 语料读取失败不阻断，退化为空戳
+        return ""
+    payload = "|".join(
+        sorted(f"{d.get('id')}:{d.get('activeVersionId') or ''}" for d in docs)
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _invalidate_stale_state(state: dict[str, Any], emit: Callable[..., None]) -> None:
+    """文档版本变化后统一失效旧阅读、旧证据与旧答案（B-02 §4.7 / HAR-T-012）。
+
+    只降级来源版本与当前活动版本不一致的记录；文档被删除/移出任务范围时
+    同样按失效处理。已经 `stale` 的答案格不会被重复计数，恢复后重复执行幂等。
+    """
+    task_id = str(state.get("task_id") or "")
+    case_id = str(state.get("case_id") or "")
+    if not task_id or not case_id:
+        return
+    from .. import documents
+
+    try:
+        docs = documents.list_task_documents(case_id)
+    except Exception:  # noqa: BLE001 语料不可读时不做失效推断
+        return
+    active = {str(d.get("id")): str(d.get("activeVersionId") or "") for d in docs}
+
+    reading_stale = 0
+    with _LEDGER_LOCK:
+        ledger = state.setdefault("reading_ledger", {})
+        for key in list(ledger):
+            entry = ledger.get(key) or {}
+            doc_id = str(entry.get("documentId") or key.split(":", 1)[0])
+            version = str(entry.get("versionId") or "")
+            if doc_id not in active or (version and active.get(doc_id) != version):
+                ledger.pop(key, None)
+                reading_stale += 1
+
+    evidence_stale = 0
+    with _LEDGER_LOCK:
+        for entry in (state.get("evidence_ledger") or {}).values():
+            source = entry.get("source") or {}
+            doc_id = str(source.get("documentId") or "")
+            if not doc_id or entry.get("status") != "supported":
+                continue
+            version = str(source.get("versionId") or "")
+            if doc_id not in active or (version and active.get(doc_id) != version):
+                entry["status"] = "needs_human"
+                entry["reasonCode"] = "VERSION_CHANGED"
+                evidence_stale += 1
+
+    cell_result = {"cells": 0, "units": 0}
+    if state.get("_runtime_version") == "v2":
+        try:
+            from . import work_ledger
+
+            cell_result = work_ledger.invalidate_changed_versions(task_id, active)
+        except Exception:  # noqa: BLE001 账本失效处理失败不阻断任务
+            cell_result = {"cells": 0, "units": 0}
+
+    if reading_stale or evidence_stale or cell_result["cells"] or cell_result["units"]:
+        try:
+            from . import work_ledger
+
+            progress = work_ledger.unit_progress(task_id)
+        except Exception:  # noqa: BLE001
+            progress = {}
+        emit("work_unit_update", {
+            "staleCells": int(cell_result.get("cells") or 0),
+            "staleUnits": int(cell_result.get("units") or 0),
+            "staleReading": reading_stale,
+            "staleEvidence": evidence_stale,
+            "progress": progress,
+        })
+
+
 def _efficiency_search(
     state: dict[str, Any], query: str, origin: str, limit: int,
     fetch: Callable[[], list[dict[str, Any]]],
+    *, document_ids: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """执行一次单检索词并记账（§10.4 D4）。
 
@@ -833,7 +1217,8 @@ def _efficiency_search(
     换词与逐页核对的确定性提示，避免用"没搜到"当作"不存在"。
     """
     key = " ".join(str(query or "").split())
-    hits, cached = _cached_term_hits(state, key, origin, fetch)
+    scope = f"{_search_scope(state, document_ids)}|{int(limit)}"
+    hits, cached = _cached_term_hits(state, key, origin, fetch, scope=scope)
     if cached:
         return {
             "query": key,
@@ -856,6 +1241,7 @@ def _efficiency_search(
 def _efficiency_search_multi(
     state: dict[str, Any], terms: list[str], origin: str, limit: int,
     fetch: Callable[[str], list[dict[str, Any]]],
+    *, document_ids: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """多检索词分别检索后按页合并去重（§6.7 / §10.4 D5 查询拆解）。
 
@@ -864,11 +1250,13 @@ def _efficiency_search_multi(
     """
     from ..search import merge_hits
 
+    scope = f"{_search_scope(state, document_ids)}|{int(limit)}"
     by_term: list[tuple[str, list[dict[str, Any]]]] = []
     cached_terms: list[str] = []
     for term in terms:
         key = " ".join(str(term or "").split())
-        hits, cached = _cached_term_hits(state, key, origin, lambda t=key: fetch(t))
+        hits, cached = _cached_term_hits(
+            state, key, origin, lambda t=key: fetch(t), scope=scope)
         if cached:
             cached_terms.append(key)
         by_term.append((key, hits))
@@ -1148,9 +1536,8 @@ def _record_evidence_locked(
             "source": (f"{source['documentTitle']}第{source['pageNo']}页" if source else None),
             "direction": direction,
         })
-    if len(ledger) > EVIDENCE_LEDGER_MAX_ENTRIES:
-        for stale_key in list(ledger)[: len(ledger) - EVIDENCE_LEDGER_MAX_ENTRIES]:
-            ledger.pop(stale_key, None)
+    # 不按固定容量淘汰（§1.1 第 4 条）：证据账本是交付与守门的依据，淘汰早期证据
+    # 会让已确认结论在收尾时找不到来源，或让重复/矛盾检测失效。单条只有摘要字段。
     return {"added": added, "updated": updated, "supported": supported,
             "needsHuman": needs_human, "entries": results[:20]}
 
@@ -1190,9 +1577,7 @@ def _record_issues_locked(state: dict[str, Any], raws: list[Any]) -> dict[str, A
         else:
             added += 1
             ledger[key] = entry
-    if len(ledger) > ISSUE_LEDGER_MAX_ENTRIES:
-        for stale_key in list(ledger)[: len(ledger) - ISSUE_LEDGER_MAX_ENTRIES]:
-            ledger.pop(stale_key, None)
+    # 同样不做容量淘汰：争点数量由案情决定，淘汰会让「未解决争点」在收尾时消失
     return {"added": added, "updated": updated, "issues": list(ledger.values())[:20]}
 
 
@@ -1320,6 +1705,488 @@ def _citation_gaps(state: dict[str, Any], answer: str) -> list[str]:
         return []
 
 
+def _deliverable_specs(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """本次任务的交付契约（已规范化）；无声明时为空列表。"""
+    from . import deliverables as deliverable_store
+
+    specs = state.get("_deliverable_specs")
+    if isinstance(specs, list):
+        return specs
+    specs = deliverable_store.normalize_specs(state.get("deliverables"))
+    state["_deliverable_specs"] = specs
+    return specs
+
+
+def _deliverable_section(state: dict[str, Any]) -> str:
+    """system prompt 的交付契约段（骨架状态 + 回写规则）；无契约时返回空串。"""
+    from . import deliverables as deliverable_store
+
+    specs = _deliverable_specs(state)
+    if not specs:
+        return ""
+    text = deliverable_store.describe(specs)
+    states = state.get("_deliverable_states") or []
+    if states:
+        created = [s["name"] for s in states if s.get("created")]
+        existing = [s["name"] for s in states if s.get("path") and not s.get("created")]
+        notes: list[str] = []
+        if created:
+            notes.append("已新建骨架：" + "、".join(created))
+        if existing:
+            notes.append("沿用已有文件：" + "、".join(existing))
+        if notes:
+            text += "\n骨架状态：" + "；".join(notes) + "（已回写的内容不会被覆盖）"
+    return text
+
+
+def _ensure_deliverable_skeletons(state: dict[str, Any], emit: Callable[..., None]) -> None:
+    """任务启动时生成交付骨架；失败只记事件，不阻断任务（交付骨架是增强而非闸门）。"""
+    from . import deliverables as deliverable_store
+
+    specs = _deliverable_specs(state)
+    if not specs:
+        return
+    try:
+        from ..sandbox import workspace_root
+
+        root = workspace_root()
+    except Exception:
+        return
+    states = deliverable_store.ensure_skeleton(root, specs)
+    state["_deliverable_states"] = states
+    emit("deliverable_skeleton", {
+        "directory": deliverable_store.DELIVERABLE_DIRNAME,
+        "files": [
+            {"name": s.get("name"), "created": bool(s.get("created")), "error": s.get("error")}
+            for s in states
+        ],
+    })
+
+
+def _setting_bool(key: str, default: bool) -> bool:
+    """读取布尔型 Agent 设置（未设置或读取失败时用默认值）。
+
+    用于功能开关（如 `agent.contextCompressionV2`、`agent.toolSearch`）：
+    未初始化工作空间或设置类型异常时返回默认值，保证评测与首次启动一致。
+    """
+    try:
+        from . import tasks as task_store
+
+        value = task_store.get_setting(key)
+    except Exception:  # noqa: BLE001
+        return default
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in ("0", "false", "off", "no", "")
+
+
+def _runtime_version_setting() -> str:
+    """读取运行时版本设置（`agent.runtimeVersion`，默认 v2）。
+
+    D-01 要求在隔离工作空间可切回 v1 做对拍；设置不存在或非法时使用默认 v2。
+    v3 为 Agent Runtime V3（Tool Journal / 租约 / Span）；在 M7 验收前只能显式
+    设置，默认值保持 v2（§4.1 / §10.1）。读取失败同样退回默认值。
+    """
+    try:
+        from . import tasks as task_store
+
+        value = str(task_store.get_setting("agent.runtimeVersion") or "").strip().lower()
+    except Exception:  # noqa: BLE001 设置不可读时用默认版本
+        return "v2"
+    return value if value in ("v1", "v2", "v3") else "v2"
+
+
+def _seed_work_ledger(state: dict[str, Any], emit: Callable[..., None]) -> None:
+    """编译并登记工作全集（B-01）：失败只记事件，不阻断任务。
+
+    只登记「必须覆盖哪些格子」，不含任何事实答案；重复编译幂等（不会新增单元）。
+    运行时版本在首次登记时钉住，恢复时沿用（不跨 V1/V2，§4.4）。
+    """
+    task_id = str(state.get("task_id") or "")
+    if not task_id:
+        return
+    specs = _deliverable_specs(state)
+    try:
+        from .. import documents
+        from . import work_contract, work_ledger
+
+        docs = documents.list_task_documents(str(state.get("case_id") or ""))
+        contract = work_contract.compile_contract(specs, docs)
+        state["_work_contract"] = contract
+        # 运行时版本（§4.4 / D-01）：新任务按设置 `agent.runtimeVersion` 钉住；
+        # 已有记录沿用已钉住的版本，恢复不跨 V1/V2。v1 只登记运行时状态，
+        # 不登记工作全集（用于与 V1 基线对拍），v2 才会派生工作单元与答案格。
+        requested = _runtime_version_setting()
+        # 无交付契约时沿用旧语义钉住 v1（不做工作全集调度）；但 V3 是运行时底座，
+        # 与其是否有交付物无关，显式设置后仍按 v3 执行（Journal/租约全覆盖）。
+        if not specs and requested != "v3":
+            requested = "v1"
+        runtime = work_ledger.ensure_runtime(task_id, requested)
+        state["_runtime_version"] = runtime.get("runtimeVersion") or "v1"
+        if state["_runtime_version"] == "v3":
+            # V3 底座（WP01）：取得任务租约并对待恢复任务做 Journal 对账。
+            # 对账只把遗留 executing 转成可解释状态，不会自动重放非幂等调用。
+            from . import tool_runtime
+
+            try:
+                token = tool_runtime.ensure_lease(state, takeover=True)
+                recon = tool_runtime.reconcile(state)
+                emit("journal_reconcile", {**recon, "fencingToken": token})
+            except Exception as exc:  # noqa: BLE001 租约失败不得静默降级为无保护执行
+                emit("journal_unavailable", {"errorCode": type(exc).__name__})
+                raise
+        if state["_runtime_version"] == "v1":
+            emit("work_unit_update", {
+                "total": 0, "cells": 0, "artifacts": len(specs),
+                "seeded": 0, "runtimeVersion": "v1",
+            })
+            return
+        inserted = work_ledger.seed_units(task_id, contract.get("workUnits") or [])
+        # 答案格预登记：让未处理格可见、可计数，并阻止物化单元在格子全空时提前执行
+        work_ledger.seed_cells(task_id, contract.get("cells") or [])
+    except Exception:  # noqa: BLE001 账本登记失败不得阻断任务本身
+        return
+    summary = contract.get("summary") or {}
+    if summary.get("workUnits"):
+        emit("work_unit_update", {
+            "total": summary.get("workUnits", 0),
+            "cells": summary.get("cells", 0),
+            "artifacts": summary.get("artifacts", 0),
+            "seeded": inserted,
+            "runtimeVersion": state.get("_runtime_version"),
+        })
+
+
+def _budget_attach(state: dict[str, Any], emit: Callable[..., None]) -> None:
+    """接入统一预算（B-02）：初始化/续接 task_budget 并回灌已用计数。
+
+    预算以 `agent/budget.py` 为唯一实现；自主循环的轮次、工具调用、模型调用与
+    Token 都经它记账。恢复时把检查点里的计数先写回，避免续跑重新获得预算。
+    """
+    task_id = str(state.get("task_id") or "")
+    if not task_id:
+        return
+    try:
+        from . import budget
+
+        snapshot = budget.ensure(task_id, state.get("budget_overrides") or None)
+        # 任务级覆盖优先（B-02 §4.4）：用户给的下限/上限不能被系统默认值抹掉；
+        # 只有缺省时才按 MAX_ROUNDS / MAX_TOOL_CALLS 推导。
+        overrides = state.get("budget_overrides") or {}
+        target_rounds = int(overrides.get("maxRounds") or MAX_ROUNDS)
+        target_tools = int(overrides.get("maxToolCalls") or MAX_TOOL_CALLS)
+        target_model_calls = int(
+            overrides.get("maxModelCalls")
+            or target_rounds + EXPLORE_TOTAL_ROUND_BUDGET * CASE_EXPLORE_MAX_ROUNDS
+        )
+        target_wall_seconds = int(
+            overrides.get("maxWallSeconds")
+            or max(int(budget.DEFAULT_LIMITS.get("maxWallSeconds") or 0),
+                   target_rounds * AUTONOMOUS_SECONDS_PER_ROUND)
+        )
+        target_tokens = int(
+            overrides.get("maxTokens")
+            or max(int(budget.DEFAULT_LIMITS.get("maxTokens") or 0),
+                   target_rounds * AUTONOMOUS_TOKENS_PER_ROUND)
+        )
+        # 自主循环的实际硬限制是 MAX_ROUNDS / MAX_TOOL_CALLS；模型调用数至少要与
+        # 轮次同量级（每轮一次模型调用 + 子代理轮次），墙钟与 Token 也要按任务
+        # 量级放宽。否则默认 12 次调用 / 300s / 20 万 token 会在任务刚开始就把
+        # 预算判成 blocked，账本里明明还有可执行单元却停止工作（B-02 统一预算）。
+        budget.upgrade_limits(task_id, {
+            "maxRounds": target_rounds,
+            "maxToolCalls": target_tools,
+            "maxModelCalls": target_model_calls,
+            "maxWallSeconds": target_wall_seconds,
+            "maxTokens": target_tokens,
+        })
+        snapshot = budget.snapshot(task_id)
+    except Exception:  # noqa: BLE001 预算初始化失败不阻断（记账层降级为内存计数）
+        return
+    # 交付保留预算（B-03 §4.5）：探索阶段不得占用；恢复时沿用检查点里的值，
+    # 新任务按最终上限拆分。该值随 budget_update 与检查点持久化。
+    try:
+        from . import scheduler
+
+        max_rounds = int((snapshot.get("limits") or {}).get("maxRounds") or MAX_ROUNDS)
+        state["_delivery_reserved"] = int(
+            state.get("_delivery_reserved")
+            or scheduler.split_budget(max_rounds)["deliveryReservedRounds"]
+        )
+    except Exception:  # noqa: BLE001 拆分失败时退回 0，不影响主循环
+        state.setdefault("_delivery_reserved", 0)
+    state["_budget"] = snapshot
+    used = (snapshot.get("used") or {})
+    restored = {
+        "roundsUsed": int(used.get("round") or 0),
+        "toolCallsUsed": int(used.get("tool_call") or 0),
+        "modelCallsUsed": int(used.get("model_call") or 0),
+        "tokens": int(used.get("tokens") or 0),
+    }
+    state["_budget_restored"] = restored
+    if any(restored.values()):
+        emit("run_recovered", {
+            "roundsUsed": restored["roundsUsed"],
+            "toolCallsUsed": restored["toolCallsUsed"],
+            "modelCallsUsed": restored["modelCallsUsed"],
+            "tokens": restored["tokens"],
+            "deliveryReservedRounds": int(state.get("_delivery_reserved") or 0),
+        })
+
+
+def _budget_spend(
+    state: dict[str, Any], kind: str, *, tokens: int = 0, count: int = 1,
+) -> None:
+    """统一记账（B-02）：轮次 / 模型调用 / 工具调用 / Token 都走 budget.py。
+
+    只记账不阻断——自主 Loop 的硬限制是 MAX_ROUNDS 与 MAX_TOOL_CALLS（A-002），
+    预算用于可观测与恢复语义，不把任务中途打死；记账失败同样不阻断执行。
+    """
+    task_id = str(state.get("task_id") or "")
+    if not task_id:
+        return
+    if kind == "model_call":
+        state["_model_calls_used"] = int(state.get("_model_calls_used") or 0) + int(count)
+    elif kind == "round":
+        state["_rounds_used"] = int(state.get("_rounds_used") or 0) + int(count)
+    try:
+        from . import budget
+
+        budget.spend(task_id, kind, tokens=tokens, count=count)
+    except Exception:  # noqa: BLE001 记账失败不得阻断任务
+        return
+
+
+def _sync_artifact_after_write(state: dict[str, Any], name: Any) -> None:
+    """单文件回写后的即时登记与写后校验（B-03）：失败只忽略，不影响回写结果。"""
+    task_id = str(state.get("task_id") or "")
+    contract = state.get("_work_contract") or {}
+    artifact_name = str(name or "").strip()
+    if not task_id or not artifact_name or not (contract.get("artifacts") or []):
+        return
+    if not any(a.get("name") == artifact_name for a in contract["artifacts"]):
+        return
+    try:
+        from .. import sandbox as sandbox_mod
+
+        from . import delivery_controller
+
+        delivery_controller.commit_artifact(
+            task_id, contract, artifact_name, sandbox_mod.workspace_root())
+    except Exception:  # noqa: BLE001 登记失败不得回滚已写入的交付内容
+        return
+
+
+def _finalize_delivery(state: dict[str, Any], emit: Callable[..., None]) -> dict[str, Any]:
+    """任务收尾交付（B-03）：原子提交每个声明交付物并登记产物。
+
+    交付不完整只如实报告，不阻断完成事件；但调用方会把它并入完成守门警告，
+    避免 UI 在交付缺失时显示「全部完成」（HAR-T-016）。
+    """
+    task_id = str(state.get("task_id") or "")
+    contract = state.get("_work_contract") or {}
+    if not task_id or not (contract.get("artifacts") or []):
+        return {"status": "pending", "artifacts": [], "gaps": []}
+    try:
+        from . import delivery_controller
+
+        delivery = delivery_controller.finalize(task_id, contract)
+    except Exception:  # noqa: BLE001 交付控制器失败不得抹掉已回答的结论
+        return {"status": "invalid", "artifacts": [], "gaps": [{"artifact": "*", "status": "invalid"}]}
+    for item in delivery.get("artifacts") or []:
+        emit("artifact_commit", {
+            "name": item.get("name"),
+            "status": item.get("status"),
+            "rows": int(item.get("rows") or 0),
+            "rowsExpected": int(item.get("rowsExpected") or 0),
+        })
+    return delivery
+
+
+def _aggregate_consistency_gaps(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """交付前聚合一致性门禁（P1-07 收尾）。
+
+    模型在任务中调用过 `table_aggregate` 时，其自声明的算子规格与机械求值结果
+    已记入 `_aggregate_runs`。收尾时把已提交答案与机械求值逐一比对：
+    不一致或答案缺失的聚合题记为待人工核实，并阻止「全部完成」。
+
+    只使用模型自己声明的规格与自己的工作空间表，不读取任何评分器真值；
+    也不静默改写模型答案——只标记、只反馈正确值。
+    """
+    runs = state.get("_aggregate_runs") or {}
+    if not isinstance(runs, dict) or not runs:
+        return []
+    from .. import aggregate
+
+    from .. import sandbox as sandbox_mod
+
+    root = sandbox_mod.workspace_root()
+    gaps: list[dict[str, Any]] = []
+    for qid, run in runs.items():
+        try:
+            table_path = str(run.get("tablePath") or "").strip()
+            if not table_path:
+                continue
+            multi_map = run.get("dealPoints") or {}
+            multi_points = (
+                {str(k) for k, v in multi_map.items() if v}
+                if isinstance(multi_map, dict) else set()
+            )
+            agreements = run.get("agreements")
+            table, _warnings = aggregate.load_table(
+                (root / table_path).resolve(),
+                agreements=[str(a) for a in agreements] if isinstance(agreements, list) else None,
+                multi_points=multi_points,
+            )
+            agrs = (
+                [str(a) for a in agreements] if isinstance(agreements, list)
+                else sorted({a for (a, _d) in table})
+            )
+            spec = dict(run.get("spec") or {})
+            if str(spec.get("op")) == "distribution" and not spec.get("options"):
+                declared = (run.get("options") or {}).get(str(spec.get("dp") or ""))
+                if isinstance(declared, list) and declared:
+                    spec["options"] = [str(o) for o in declared]
+            expected = aggregate.compute(spec, table, agrs)
+        except Exception:  # noqa: BLE001 无法复算时不误判为不一致
+            continue
+        submitted = _submitted_answer(state, qid)
+        verdict = aggregate.check_consistency(spec, table, agrs, submitted)
+        if not verdict.get("consistent"):
+            if verdict.get("error"):
+                reason = str(verdict["error"])
+            elif submitted is None:
+                reason = "该题未在交付物中给出答案"
+            else:
+                reason = "写入的答案与表格机械求值不一致（可能手抄错或用旧表）"
+            gaps.append({
+                "questionId": qid,
+                "op": spec.get("op"),
+                "expected": expected,
+                "submitted": submitted,
+                "reason": reason,
+            })
+    return gaps
+
+
+def _submitted_answer(state: dict[str, Any], question_id: str) -> Any:
+    """读取已落盘 JSON 交付物中该聚合题的答案（读不到返回 None，按缺失处理）。"""
+    import json as _json
+
+    try:
+        from .. import sandbox as sandbox_mod
+
+        from . import deliverables as deliverable_store
+
+        directory = deliverable_store.submission_dir(sandbox_mod.workspace_root())
+        for spec in _deliverable_specs(state):
+            if str(spec.get("format") or "") != "json":
+                continue
+            path = directory / str(spec.get("name") or "")
+            if not path.exists():
+                continue
+            try:
+                data = _json.loads(path.read_text(encoding="utf-8") or "{}")
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and question_id in data:
+                return data[question_id]
+            path_keys = list(spec.get("path") or [])
+            item_key = str(spec.get("itemKey") or "")
+            if path_keys and item_key and isinstance(data, dict):
+                node: Any = data
+                for key in path_keys:
+                    node = node.get(key) if isinstance(node, dict) else None
+                for row in node if isinstance(node, list) else []:
+                    if isinstance(row, dict) and str(row.get(item_key) or "") == question_id:
+                        return row.get("answer")
+    except Exception:  # noqa: BLE001 读取失败按未提交处理
+        return None
+    return None
+
+
+def _work_progress(state: dict[str, Any]) -> dict[str, Any] | None:
+    """工作进度（B-05）：全部数值来自工作账本；未启用账本时返回 None。"""
+    task_id = str(state.get("task_id") or "")
+    if not task_id or not state.get("_work_contract"):
+        return None
+    try:
+        from . import scheduler
+
+        return scheduler.progress(task_id)
+    except Exception:  # noqa: BLE001 进度读取失败不影响任务收尾
+        return None
+
+
+def _budget_snapshot(state: dict[str, Any]) -> dict[str, Any] | None:
+    """预算快照（B-05）：已用/上限/阶段，供 UI 展示真实预算进度。"""
+    task_id = str(state.get("task_id") or "")
+    if not task_id:
+        return None
+    try:
+        from . import budget
+
+        snap = budget.snapshot(task_id)
+    except Exception:  # noqa: BLE001
+        return None
+    return {
+        "stage": snap.get("stage"),
+        "limits": snap.get("limits") or {},
+        "used": budget.public_used(snap.get("used")),
+        "reasons": snap.get("reasons") or [],
+        "deliveryReservedRounds": int(state.get("_delivery_reserved") or 0),
+    }
+
+
+def _inject_deliverable_hint(
+    messages: list[dict[str, Any]], state: dict[str, Any], round_no: int, *, wrap_up: bool,
+) -> None:
+    """周期回写提示（P0-04）：每 N 轮注入一次；收尾模式下每轮都提示。
+
+    提示只是把"交付物已存在、可增量回写"这一事实重复摆到模型眼前，
+    不指定写什么内容——内容仍须来自已核实的原文。
+    """
+    from . import deliverables as deliverable_store
+
+    specs = _deliverable_specs(state)
+    if not specs:
+        return
+    names = "、".join(f"{deliverable_store.DELIVERABLE_DIRNAME}/{s['name']}" for s in specs)
+    if wrap_up:
+        content = (
+            f"【收尾模式】预算即将耗尽（第 {round_no} 轮），已禁止新开检索与整卷阅读。"
+            f"请立即把已经确认的结论用 deliverable_patch 写回 {names}，"
+            "然后输出最终回答：已完成的结论（含来源标注）+ 未完成/待核实事项。"
+        )
+    else:
+        content = (
+            f"【交付回写提醒】已完成 {round_no} 轮。请立即把当前已确认的结论用 "
+            f"deliverable_patch 合并写回 {names}（按主键 upsert，不会覆盖已有行），"
+            "不要等全部分析完成才写；未确认的内容不要写入。"
+        )
+    messages.append({"role": "user", "content": content})
+
+
+def _wrap_up_mode(
+    round_no: int, max_rounds: int, tool_calls_total: int, max_calls: int,
+    delivery_reserved: int = 0,
+) -> bool:
+    """是否进入收尾模式：轮数或调用数剩余不足阈值时禁止新开检索。
+
+    `delivery_reserved` 是交付保留轮次（B-03 §4.5）：剩余轮次低于该值时，探索
+    必须停止，把预算留给物化、校验与最终作答。
+    """
+    rounds_left = max_rounds - round_no
+    calls_left = max_calls - tool_calls_total
+    round_floor = max(
+        WRAP_UP_MIN_ROUNDS, int(max_rounds * WRAP_UP_ROUND_RATIO), int(delivery_reserved or 0),
+    )
+    call_floor = max(WRAP_UP_MIN_ROUNDS * 4, int(max_calls * WRAP_UP_ROUND_RATIO))
+    return rounds_left <= round_floor or calls_left <= call_floor
+
+
 def _deliverable_issues(state: dict[str, Any], answer: str) -> list[dict[str, str]]:
     """交付账本检查（§5.7）：声称生成的文件是否真实存在、必需产物是否已建。"""
     issues: list[dict[str, str]] = []
@@ -1382,6 +2249,34 @@ def _deliverable_issues(state: dict[str, Any], answer: str) -> list[dict[str, st
                 })
         except Exception:  # noqa: BLE001
             pass
+    # 交付契约完整性（P0-04）：声明的交付物缺失或只有空骨架时给出警告，
+    # 让用户能分辨「有交付物但未填完」与「完全没有交付物」
+    specs = _deliverable_specs(state)
+    if specs:
+        try:
+            from ..sandbox import workspace_root
+
+            from . import deliverables as deliverable_store
+
+            missing, empty = deliverable_store.missing_or_empty(workspace_root(), specs)
+        except Exception:  # noqa: BLE001
+            missing, empty = [], []
+        if missing:
+            issues.append({
+                "code": "MISSING_DELIVERABLE",
+                "text": f"交付物未生成：{'、'.join(missing)}",
+                "files": missing,
+                "instruction": f"以下交付文件尚不存在：{'、'.join(missing)}。"
+                               "请用 deliverable_patch 写入已完成的内容后再输出结论。",
+            })
+        elif empty:
+            issues.append({
+                "code": "EMPTY_DELIVERABLE",
+                "text": f"交付物仅有骨架、尚无内容：{'、'.join(empty)}",
+                "files": empty,
+                "instruction": f"以下交付文件仍是空骨架：{'、'.join(empty)}。"
+                               "请先把已确认的结论用 deliverable_patch 回写，再输出结论。",
+            })
     return issues
 
 
@@ -1451,6 +2346,22 @@ def _finalize_gate(
         warnings.append(warning)
         if allow_repairs:
             repairs.append({"code": issue["code"], "instruction": issue["instruction"]})
+    # 聚合一致性（P1-07）：模型调用过 table_aggregate 的题，交付答案必须与
+    # 机械求值一致。不一致时先给模型一次用工具重算并回写的机会，不静默替它作答。
+    for gap in _aggregate_consistency_gaps(state):
+        warnings.append({
+            "code": "AGGREGATE_INCONSISTENT",
+            "text": f"聚合题 {gap['questionId']} 的答案与表格机械求值不一致"
+                    f"（提交 {gap['submitted']!r}，应为 {gap['expected']!r}）：{gap['reason']}",
+        })
+        if allow_repairs:
+            repairs.append({
+                "code": "AGGREGATE_INCONSISTENT",
+                "instruction": f"聚合题 {gap['questionId']} 的当前答案与表内容不符（{gap['reason']}）。"
+                               f"请用 table_aggregate 重新机械求值，再通过 deliverable_patch "
+                               f"把结果写回该题；机械求值应为 {gap['expected']!r}。"
+                               "若确认表中数据本身有误，请先修正表再重算，不要手改答案。",
+            })
     # 缺口驱动补查（§10.3 C7）：未关闭的争点说明调查尚未收敛，先给一次性精准补查机会；
     # 简单定位任务（direct）不因账本存在而被拖入额外调查。
     depth = str(contract.get("taskDepth") or "")
@@ -1503,6 +2414,42 @@ def _repair_prompt(repairs: list[dict[str, str]]) -> str:
 # 模式提示：工具导航 + 领域纪律（自 graph.py 旧固定管线提示词迁移）+ 完成标准。
 # 分层组装（05 方案 §6.6 D1）：本段是稳定认知方法与完成标准，交付格式（表格/出图）
 # 拆到下面两段，仅在确有该交付需求时注入——普通单点问答不再承担格式规则的固定开销。
+# 同族条款角色消歧（P1-08 §4.5）：并购合同中 Target/Company 与 Parent/Buyer 的
+# 同类定义常常相邻。检索只能证明"找到定义"，不区分定义主体；实测选错一侧会让
+# 目标方整片格子错位。这段提示要求先枚举全部同族定义、再按主体选，并给了校验工具。
+_ROLE_DISAMBIGUATION_HINT = (
+    "同族条款消歧（遇到 Material Adverse Effect / Change 等成对定义时必须执行）：\n"
+    "- 第一步：先列出片段中【全部】同族定义（含前缀变体，如 Parent Material Adverse Effect、"
+    "Buyer Material Adverse Effect、以及无前缀版本），分别标注其指向的主体（收购方/目标方）；\n"
+    "- 第二步：确认题目问的是哪一侧（Target/Company = 目标方；Parent/Buyer = 收购方），"
+    "再选用对应主体的定义作答；不要因为两个定义相邻就取先出现的那个；\n"
+    "- 第三步：写入结论前用 clause_role_check 校验引文与题目主体是否同侧；"
+    "verdict=mismatch 时必须改用对应侧定义，两侧都找不到则标为待核实（needs_human），"
+    "不得用另一侧定义顶替，也不得把待核实写成确定结论。\n"
+    "- 第四步（同一个 MAE 定义里有多条 except / 除外情形时，逐条判断归属，不要整体打包）：\n"
+    "  · 某条写的是「general economic / capital market conditions」或「the economy or the "
+    "financial, securities or credit markets」这类一般性范围，才计入「一般经济/金融状况」类；\n"
+    "  · 若经济类表述被行业主体限定（如 affecting financial institutions generally、"
+    "applicable to banks or bank holding companies），该条应按「行业变化」类计入，"
+    "不计入一般经济类；只有条款把一般经济/资本市场与行业范围并列写出时，两类才都算命中；\n"
+    "  · disproportionate impact（重大不成比例影响）修饰跟着它所在的那一条走："
+    "只按该条所属类目记一次，不要因为文中出现 disproportionate 就给相邻类目也记一条；\n"
+    "  · 同一格里两个类目都说得通时，按条款原文的主体范围择一并在备注标注待核实，不要两边都勾。"
+)
+
+# 多选题逐项核对（P2-09 §4.6）：一次性选出"所有适用项"时，模型倾向于把
+# 相关但原文未明确包含的选项一并勾上（基线多选格 F1 0.69）。改成两段式：
+# 先给候选集合，再对每个选项独立核对"原文是否明确包含该情形"并给原句。
+_MULTI_CHOICE_HINT = (
+    "多选题核对（题目要求选出一项或多项、或要求列出满足某条件的全部对象时）：\n"
+    "- 第一段：先列出候选集合（选项全集，或材料中出现的全部候选对象）；\n"
+    "- 第二段：对每个候选【独立】核对「原文是否明确包含该情形」，并给出支撑原句与页码；"
+    "只有找到明确原文的才保留，相关但原文未明确写出的不选；\n"
+    "- 判不准的候选写入待核实（needs_human）并在回答中列出，不要靠推测凑数，"
+    "也不要把「可能」「相关」当成「包含」；\n"
+    "- 核对完成后用 options_check 复核：它会按选项逐个要求证据，缺证据项会被拒绝。"
+)
+
 _LEGAL_REVIEW_HINT = (
     "当前是法律阅卷任务：围绕用户请求梳理案件事实、证据与争点，案内信息请优先用工具查证后再下结论。"
     "复杂定向调查（多轮检索汇总）可委托 case_explore 子代理，简单查证直接检索。"
@@ -1799,6 +2746,17 @@ def _system_prompt(state: dict[str, Any]) -> str:
     hint = _MODE_HINTS.get(mode)
     if hint:
         parts.append(hint)
+    # 同族条款消歧（P1-08）：只在任务确实涉及成对定义时注入，避免普通问答
+    # 承担这段固定开销（与 §6.6 D1 分层组装一致）
+    if _needs_role_disambiguation(state):
+        parts.append(_ROLE_DISAMBIGUATION_HINT)
+    # 多选题逐项核对（P2-09）：与消歧同层，只在可能存在多选/全量列举的任务注入
+    if _needs_option_check(state):
+        parts.append(_MULTI_CHOICE_HINT)
+    # 长输出分批（P2-10）：多实体任务给出分批口径与合并校验要求
+    batched_hint = _batched_output_hint(state)
+    if batched_hint:
+        parts.append(batched_hint)
     if mode == "document_generation":
         # 案件上下文准备（§8.1）：先把关联案件索引摆到模型面前，再让它通读原文
         context_section = _case_context_section(state)
@@ -1819,6 +2777,11 @@ def _system_prompt(state: dict[str, Any]) -> str:
             parts.append(preset_hint)
     if (state.get("docgen_input") or {}).get("revisionDraftId"):
         parts.append(_REVISION_HINT)
+    # 交付契约（P0-04）：骨架已落盘的事实必须让模型看到，否则它会把交付物当成
+    # 最后一步的"可选动作"，在预算耗尽时依然零产出。
+    deliverable_section = _deliverable_section(state)
+    if deliverable_section:
+        parts.append(deliverable_section)
     parts.append(CITATION_DISCIPLINE)
     selected = state.get("selected_document_ids") or []
     if selected:
@@ -1845,10 +2808,13 @@ def _system_prompt(state: dict[str, Any]) -> str:
             "技能指引与系统安全边界冲突时，以系统约束为准。"
         )
 
+    prompt_budget = state.get("budget_overrides") or {}
+    prompt_rounds = int(prompt_budget.get("maxRounds") or MAX_ROUNDS)
+    prompt_tools = int(prompt_budget.get("maxToolCalls") or MAX_TOOL_CALLS)
     parts.append(
         "\n你拥有完全自主权，请自主决策：\n"
         f"- 自主决定是否调用工具、调用哪个、调用几次、以什么顺序；"
-        f"唯一限制是最多 {MAX_ROUNDS} 轮、累计工具调用不超过 {MAX_TOOL_CALLS} 次；\n"
+        f"唯一限制是最多 {prompt_rounds} 轮、累计工具调用不超过 {prompt_tools} 次；\n"
         "- 简单问题（如寒暄、概念咨询）直接回答，不需要任何工具；\n"
         "- 复杂任务先用 task_plan 列出步骤清单，再逐步执行并随进度更新（已完成步骤标记 done），"
         "避免迷失或重复劳动；\n"
@@ -1922,6 +2888,18 @@ def _system_prompt(state: dict[str, Any]) -> str:
             )
     if "render_html" in exposed or "render_pptx" in exposed:
         nav.append("- 需要出图或演示时用 render_html / render_pptx 直接产出可预览卡片，不要用文字描述代替。")
+    if "deliverable_patch" in exposed:
+        nav.append(
+            "- 本次任务已生成交付骨架（submission/ 目录）：每确认一条内容就用 deliverable_patch "
+            "按主键立即回写（CSV 写 rows，JSON 写 rows/merge，Markdown 写 content），"
+            "不要攒到全部完成再写，也不要用 write_file 整文件覆盖交付物；"
+        )
+    if "table_aggregate" in exposed:
+        nav.append(
+            "- 跨文档统计题（计数/分布/极值/分组/少数派等）必须先用 table_aggregate 机械求值："
+            "把已核实的单元格写成 CSV 落在工作区，再用声明式算子计算；"
+            "禁止在上下文中对整表心算（容易漏格、错数，且无法复现）。"
+        )
     if nav:
         parts.append("\n工具使用要点：\n" + "\n".join(nav))
     parts.append(
@@ -2145,6 +3123,79 @@ def _fn(name: str, description: str, parameters: dict[str, Any]) -> dict[str, An
 def _tool_specs() -> list[dict[str, Any]]:
     return [
         _fn(
+            "tool_search",
+            "按中文描述检索当前任务可用的工具（返回工具名、用途与关键参数摘要）。"
+            "当你不确定用什么工具完成某件事（例如「怎么生成图表」「如何查历史结论」）时先检索，"
+            "不要凭空猜测工具名。只会返回你有权限调用的工具。",
+            {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "用中文描述你要做的事，如「读第几页原文」「生成关系图」"},
+                    "limit": {"type": "integer", "description": "返回条数上限，默认 8"},
+                },
+                "required": ["query"],
+            },
+        ),
+        _fn(
+            "tool_describe",
+            "查看某个工具的完整参数说明（只读取说明，不执行工具）。"
+            "拿到 tool_search 结果后，若需要确认参数细节再用本工具。",
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "工具名（来自 tool_search）"},
+                },
+                "required": ["name"],
+            },
+        ),
+        _fn(
+            "tool_call",
+            "调用一个经 tool_search 发现的低频工具。"
+            "本工具与直接调用等效：同样经过权限校验、审批、Journal 与预算，不会绕过任何限制。",
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "要调用的工具名"},
+                    "arguments": {
+                        "type": "object",
+                        "description": "该工具的参数对象（先用 tool_describe 确认）",
+                    },
+                },
+                "required": ["name", "arguments"],
+            },
+        ),
+        _fn(
+            "tool_batch",
+            "批量并行只读检索：把多个**只读**调用（读页/检索/记忆检索/文件读取）"
+            "一次性提交，运行时会受限并发执行并收集各自结果与错误。"
+            "写入、交付、记忆写入、Shell 与外部副作用工具一律被拒绝（必须单独串行调用）。",
+            {
+                "type": "object",
+                "properties": {
+                    "calls": {
+                        "type": "array",
+                        "description": "调用数组，每项 {id, tool, arguments}；最多 12 项",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "description": "本次调用在本批内的唯一标识"},
+                                "tool": {"type": "string", "description": "只读工具名"},
+                                "arguments": {"type": "object", "description": "该工具参数"},
+                            },
+                            "required": ["id", "tool"],
+                        },
+                    },
+                    "concurrency": {"type": "integer", "description": "期望并发数，运行时会封顶"},
+                    "onError": {
+                        "type": "string",
+                        "enum": ["collect", "fail_fast"],
+                        "description": "collect：收集错误继续（默认）；fail_fast：遇错停止",
+                    },
+                },
+                "required": ["calls"],
+            },
+        ),
+        _fn(
             "documents_list",
             "列出当前案件的全部文档（卷宗材料清单），了解案件材料构成时使用。",
             {"type": "object", "properties": {}},
@@ -2154,7 +3205,9 @@ def _tool_specs() -> list[dict[str, Any]]:
             "在当前案件卷宗内做全文检索（按页命中），返回文档名、页码与命中片段。"
             "查证某个事实、关键词、人名、金额在案内哪些位置出现时使用。"
             "复杂问题可传 queries 数组把问题拆成人名/日期/金额/文书名/争议术语多路检索，"
-            "结果按页合并去重（matchedTerms 标明该页被哪些词命中），比逐个词反复搜索更省。",
+            "结果按页合并去重（matchedTerms 标明该页被哪些词命中），比逐个词反复搜索更省。"
+            "卷宗有多份同类材料（多份合同、多份笔录）时传 documentIds 把检索限定在其中一份或几份，"
+            "否则全局排序可能只覆盖少数材料。",
             {
                 "type": "object",
                 "properties": {
@@ -2162,6 +3215,11 @@ def _tool_specs() -> list[dict[str, Any]]:
                     "queries": {
                         "type": "array",
                         "description": "多路检索词（2-5 个实词，如当事人姓名、金额、文书名称），按页合并去重",
+                        "items": {"type": "string"},
+                    },
+                    "documentIds": {
+                        "type": "array",
+                        "description": "可选：只在指定材料内检索（ID 来自 documents_list）；多份同类材料时用来逐份核查",
                         "items": {"type": "string"},
                     },
                     "limit": {"type": "integer", "description": "返回条数上限，默认 8，最大 50"},
@@ -2248,6 +3306,27 @@ def _tool_specs() -> list[dict[str, Any]]:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "多个相互独立的调查问题（并行执行，最多 3 个；与 question 二选一）",
+                    },
+                },
+            },
+        ),
+        _fn(
+            "work_unit_run",
+            "按工作全集派发「工作型子代理」：每个子代理绑定一个明确的工作单元"
+            "（如某份协议×某个问题、某被告×某字段），使用独立上下文只读该单元相关材料，"
+            "结果写入暂存区与答案格账本，正式交付物由系统原子生成并校验。"
+            "本工具在任务声明了交付契约时可用；不传 workUnitId 时由系统按依赖与优先级选下一个单元。"
+            "适合大卷宗多格子任务（如 20 份协议×15 个问题）；单点小问题仍直接检索与读页。",
+            {
+                "type": "object",
+                "properties": {
+                    "workUnitId": {
+                        "type": "string",
+                        "description": "指定工作单元 ID（来自 system 状态摘要）；缺省由系统调度",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": f"本次最多执行几个单元，默认 1，上限 {MAX_WORK_UNITS_PER_CALL}",
                     },
                 },
             },
@@ -2644,6 +3723,152 @@ def _tool_specs() -> list[dict[str, Any]]:
                 "required": ["command"],
             },
         ),
+        # 长输出合并校验（P2-10）：分批生成后校验实体齐全与口径一致
+        _fn(
+            "merge_fragments_check",
+            "长输出分批后的合并校验：按主键合并各批片段，并检查实体是否齐全/重复、"
+            "roles 与 charges 的键集合是否一致。返回 merged（可直接回写交付物）、"
+            "conflicts（同一主键冲突，需人工裁决）、issues（缺失/口径不一致）。"
+            "分批生成 8~12 个被告这类长结构化输出后必须调用一次。",
+            {
+                "type": "object",
+                "properties": {
+                    "fragments": {
+                        "type": "array",
+                        "description": "各批生成的片段（对象或对象数组）；对象含 path 时按该路径取数组",
+                        "items": {},
+                    },
+                    "keyField": {"type": "string", "description": "实体主键字段名（如 defendant / name / id）"},
+                    "path": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "片段中数组所在路径（如 [\"defendants\"]）；缺省按片段本身处理",
+                    },
+                    "expectedEntities": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "期望的实体主键全集（检查是否缺人/多人）；缺省按请求识别的数量",
+                    },
+                    "rolesField": {"type": "string", "description": "角色字段名，缺省 roles"},
+                    "chargesField": {"type": "string", "description": "罪名字段名，缺省 charges"},
+                },
+                "required": ["fragments", "keyField"],
+            },
+        ),
+        # 多选题逐项核对（P2-09）：每个选项必须有可回查原文才算选中
+        _fn(
+            "options_check",
+            "多选逐项核对：对候选选项逐个要求原文引句（quote + documentId + pageNo），"
+            "系统回查原文后只保留有证据的项；无证据或引句不匹配的项进入 needsHuman / "
+            "invalidQuotes，不得写入答案。用于多选格、'列出全部满足条件的对象'类问题。",
+            {
+                "type": "object",
+                "properties": {
+                    "subject": {"type": "string", "description": "这一格/这题问的内容（仅回报用）"},
+                    "options": {
+                        "type": "array",
+                        "description": "候选列表：对象数组 [{value, quote, documentId, pageNo}]；"
+                                       "只给字符串会被视为未核对",
+                        "items": {},
+                    },
+                },
+                "required": ["options"],
+            },
+        ),
+        # 同族条款消歧（P1-08）：抽取后校验引用定义与题目主体是否同侧
+        _fn(
+            "clause_role_check",
+            "校验一条定义类结论引用的条款变体是否与题目主体同侧（同族条款消歧）。"
+            "会扫描文档全文找出同族定义（如 Parent/Buyer MAE 与 Target/Company MAE），"
+            "返回 verdict：aligned（同侧，可作答）/ mismatch（引用了另一侧定义，必须改用对应侧）/"
+            "unknown（未找到族内术语或题目主体不明）。只在涉及成对定义时调用。",
+            {
+                "type": "object",
+                "properties": {
+                    "documentId": {"type": "string", "description": "定义所在文档 id"},
+                    "quote": {"type": "string", "description": "引用的定义原文片段（含术语）"},
+                    "subject": {
+                        "type": "string",
+                        "description": "题目问的主体，如 Target / Company / 目标方 / Parent / Buyer / 收购方",
+                    },
+                },
+                "required": ["documentId", "quote", "subject"],
+            },
+        ),
+        # 跨文档聚合（P1-07）：聚合题必须由工具机械求值，不靠模型心算
+        _fn(
+            "table_aggregate",
+            "对已落盘的结构化表（CSV）按声明式算子做确定性聚合，返回精确结果。"
+            "跨文档统计题（计数、列出满足条件的协议、选项分布、极值、少数派、离群、分组、"
+            "画像数、最相似）一律先查表再调用本工具，禁止在上下文中自己心算。"
+            "算子：count / list / distribution / extremum / minority / outlier / groups / "
+            "n_profiles / most_similar；条件：all / any / not / eq / in / has / same_as。"
+            "返回的 value 可直接写入交付物答案字段。",
+            {
+                "type": "object",
+                "properties": {
+                    "tablePath": {
+                        "type": "string",
+                        "description": "表文件路径（相对工作空间，如 work/deal_points.csv）",
+                    },
+                    "agreements": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "参与聚合的协议标识列表；缺省用表中出现的全部",
+                    },
+                    "dealPoints": {
+                        "type": "object",
+                        "description": "多选列声明，如 {\"mae_co_economic\": true}；影响条件比较与集合算子",
+                    },
+                    "options": {
+                        "type": "object",
+                        "description": "各列的选项全集，如 {\"mae\": [\"Yes\",\"No\"]}；distribution 用它补齐零值项",
+                    },
+                    "questions": {
+                        "type": "array",
+                        "description": "聚合问题数组，每项含 id / op，以及该算子所需字段"
+                                       "（cond、dp、dps、score、mode、target、max_holders、min_dev 等）",
+                        "items": {"type": "object"},
+                    },
+                    "answers": {
+                        "type": "object",
+                        "description": "已写入答案（{题号: 值}）。传入后逐题对拍表求值结果，"
+                                       "返回 consistency 与 consistent，防止「表 A 答 B」",
+                    },
+                },
+                "required": ["tablePath", "questions"],
+            },
+        ),
+        # 交付回写（P0-04）：按主键 upsert 已声明的交付物，避免整文件重写
+        _fn(
+            "deliverable_patch",
+            "把已确认的内容增量写回本次任务的交付物（submission/ 目录下的声明文件）。"
+            "CSV 按主键 upsert 行；JSON 按 itemKey upsert 数组元素或用 merge 按字段合并；"
+            "Markdown 追加或覆盖正文。重复写同一主键只更新该条，不会丢已有内容。"
+            "只写经原文核实的内容；不要用 write_file 整文件覆盖交付物。",
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "交付文件名（如 deal_points.csv）"},
+                    "rows": {
+                        "type": "array",
+                        "description": "要写入/更新的条目（对象数组）。CSV 按声明的主键列 upsert；JSON 按 itemKey upsert",
+                        "items": {"type": "object"},
+                    },
+                    "merge": {
+                        "type": "object",
+                        "description": "JSON 交付物的按字段深度合并对象（与 rows 二选一或并用）",
+                    },
+                    "content": {"type": "string", "description": "Markdown 交付物的正文"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["replace", "append"],
+                        "description": "Markdown 写入方式：replace（默认，覆盖正文）或 append（追加）",
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
         _fn(
             "render_html",
             "把一份完整 HTML 文档渲染为用户可见的交互预览卡片（自动展示在正文预览区、最终回答下方，支持全屏与查看源码）。需要向用户展示可视化结果（如图表、时间轴、表格、交互组件）时使用；HTML 会以沙箱 iframe 运行。单次上限约 200KB。"
@@ -2813,6 +4038,148 @@ def _explore_release(state: dict[str, Any], cap: int, actual: int) -> None:
         reserved = int(state.get("_explore_rounds_reserved") or 0)
         state["_explore_rounds_reserved"] = max(0, reserved - cap)
         state["_explore_rounds_used"] = int(state.get("_explore_rounds_used") or 0) + actual
+    # 子代理轮次纳入统一预算计数（B-02 §4.4）：只记账不设独立硬上限，
+    # 供 UI 与评测查询实际探索成本；失败不影响主流程。
+    if actual > 0:
+        try:
+            from . import budget
+
+            task_id = str(state.get("task_id") or "")
+            if task_id:
+                budget.spend(task_id, "subagent_round", count=int(actual))
+        except Exception:  # noqa: BLE001 记账失败不阻断子代理结算
+            pass
+
+
+def _run_work_units(state: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+    """按工作单元派发子代理（B-04）：绑定单元、独立上下文、只写暂存区。
+
+    - 未指定 workUnitId 时由调度器按依赖与优先级选出下一个单元；
+    - 每个单元执行前先取租约（attempts+1），重试不会重复提交；
+    - 结果只进暂存区与答案格账本，正式交付物仍由交付控制器原子写入。
+    """
+    from . import scheduler, work_ledger, worker
+
+    task_id = str(state.get("task_id") or "")
+    if not task_id or not state.get("_work_contract"):
+        return {
+            "error": "本次任务没有工作全集（未声明交付契约）：请直接用检索与读页工具完成，"
+                     "或先说明需要产出哪些交付物。",
+        }
+    limit = max(1, min(int(args.get("limit") or 1), MAX_WORK_UNITS_PER_CALL))
+    requested = str(args.get("workUnitId") or "").strip()
+    unit = work_ledger.get_unit(task_id, requested) if requested else None
+    if requested and unit is None:
+        return {"error": f"工作单元不存在：{requested}"}
+    # 探索派发只做「抽格」类单元；物化与派生是确定性写入，交给交付控制器
+    explore_types = (
+        "entity_question", "entity_field", "document_question", "document_field", "artifact",
+    )
+    if unit is not None and unit["scopeType"] in ("materialize", "derive"):
+        return {
+            "error": f"单元 {requested} 属于物化/派生类，由系统在收尾时统一执行，"
+                     "不需要子代理处理；请继续处理内容类工作单元或直接输出结论。",
+        }
+    if unit is None:
+        unit = scheduler.select_next(
+            task_id, exclude=tuple(state.get("_attempted_units") or ()),
+            scope_types=explore_types,
+        )
+    if unit is None:
+        # 探索阶段不允许占用交付保留预算：没有可执行单元时如实返回缺口
+        return {
+            "error": "没有可继续执行的工作单元（全部已进入终态、依赖未满足或已达最大尝试次数）。"
+                     "请输出最终回答并列出未完成/待核实事项。",
+            "progress": work_ledger.unit_progress(task_id),
+        }
+    results: list[dict[str, Any]] = []
+    for _ in range(limit):
+        if unit is None:
+            break
+        leased = work_ledger.lease_unit(task_id, unit["workUnitId"])
+        if leased is None:
+            unit = scheduler.select_next(
+                task_id, exclude=tuple(state.get("_attempted_units") or ()),
+                scope_types=explore_types,
+            )
+            continue
+        attempted = state.setdefault("_attempted_units", [])
+        if leased["workUnitId"] not in attempted:
+            attempted.append(leased["workUnitId"])
+        emit = state.get("_emit") or (lambda *_a, **_k: None)
+        dispatch_payload = {
+            "workUnitId": leased["workUnitId"],
+            "status": "leased",
+            "attempts": leased["attempts"],
+            "progress": work_ledger.unit_progress(task_id),
+        }
+        if leased.get("lastErrorCode"):
+            dispatch_payload["lastErrorCode"] = leased["lastErrorCode"]
+        emit("work_unit_update", dispatch_payload)
+        # 当前单元写入 state：下一轮 system 组装据此注入该单元简报（B-04）
+        state["_current_unit"] = leased
+        result = worker.run_worker(state, leased)
+        status = str(result.get("status") or "")
+        if status in ("committed", "needs_human", "blocked"):
+            # 状态机不允许 leased → committed 跳级：子代理结果先落暂存（staged），
+            # 再按校验结论进入终态，保证账本里能看出「暂存过、校验过」
+            staged_ok = False
+            try:
+                work_ledger.transition_unit(
+                    task_id, leased["workUnitId"], "staged",
+                    output_ref=(result.get("staged") or {}).get("path"),
+                )
+                staged_ok = True
+            except work_ledger.InvalidTransition:
+                pass
+            if staged_ok:
+                try:
+                    work_ledger.transition_unit(
+                        task_id, leased["workUnitId"], status,
+                        error_code=(result.get("commit") or {}).get("reasonCode"),
+                    )
+                except work_ledger.InvalidTransition:
+                    pass
+        elif status == "error":
+            # 服务类失败按 blocked 记录；证据类失败用累计尝试次数判定连续失败，
+            # 第二次仍无有效结果 → needs_human，不能一直停在租约态（HAR-T-011）。
+            scheduler.record_failure(
+                task_id, leased["workUnitId"],
+                str(result.get("errorClass") or "UNKNOWN").upper(),
+                streak=max(1, int(leased.get("attempts") or 1)),
+            )
+        elif status == "cancelled":
+            raise task_store.TaskCancelled("用户停止")
+        final_unit = work_ledger.get_unit(task_id, leased["workUnitId"]) or {}
+        completion_status = status
+        if status == "error" and final_unit.get("status") in ("needs_human", "blocked"):
+            completion_status = final_unit["status"]
+        completion_payload = {
+            "workUnitId": leased["workUnitId"],
+            "status": completion_status,
+            "progress": work_ledger.unit_progress(task_id),
+        }
+        if final_unit.get("lastErrorCode"):
+            completion_payload["lastErrorCode"] = final_unit["lastErrorCode"]
+        reason_code = (result.get("commit") or {}).get("reasonCode") \
+            or result.get("reasonCode")
+        if reason_code:
+            completion_payload["reasonCode"] = reason_code
+        emit("work_unit_update", completion_payload)
+        results.append(result)
+        unit = (
+            scheduler.select_next(
+                task_id, exclude=tuple(state.get("_attempted_units") or ()),
+                scope_types=explore_types,
+            )
+            if len(results) < limit else None
+        )
+    return {
+        "units": results,
+        "progress": work_ledger.unit_progress(task_id),
+        "cells": work_ledger.cell_progress(task_id),
+        "note": "子代理结果只写入暂存区与答案格账本；正式交付物由系统在收尾时原子生成并校验。",
+    }
 
 
 def _run_case_explore_many(
@@ -2920,8 +4287,13 @@ def _run_case_explore(
     cancel_check = state.get("_cancel_check") or (lambda: False)
 
     def _add_usage(usage: dict[str, Any]) -> None:
-        usage_total["promptTokens"] = usage_total.get("promptTokens", 0) + int(usage.get("promptTokens") or 0)
-        usage_total["completionTokens"] = usage_total.get("completionTokens", 0) + int(usage.get("completionTokens") or 0)
+        prompt_tokens = int(usage.get("promptTokens") or 0)
+        completion_tokens = int(usage.get("completionTokens") or 0)
+        usage_total["promptTokens"] = usage_total.get("promptTokens", 0) + prompt_tokens
+        usage_total["completionTokens"] = usage_total.get("completionTokens", 0) + completion_tokens
+        # 子代理模型调用与 Token 同样纳入统一预算（B-02 §4.4）
+        _budget_spend(
+            state, "model_call", tokens=prompt_tokens + completion_tokens)
 
     policy = state.get("model_policy") or {}
     model_id = str(policy.get("modelId") or model_gateway.DEFAULT_MODEL)
@@ -2957,6 +4329,20 @@ def _run_case_explore(
     searches = 0
     rounds = 0
     conclusion = ""
+    # 子代理进度登记（§7.5）：只记类型、轮次、工具调用计数与状态；
+    # 调查问题写入加密库供人工核对，不进 Span 与日志。
+    run_id = None
+    try:
+        from . import subagent_runs
+
+        run_id = subagent_runs.start(
+            str(state.get("task_id") or ""), kind="explore",
+            scope={"question": question[:200], "roundsLimit": round_cap,
+                   "callId": call_id, "origin": "case_explore"},
+            rounds_limit=round_cap,
+        )["id"]
+    except Exception:  # noqa: BLE001 登记失败不影响调查本身
+        run_id = None
     try:
         for round_no in range(1, round_cap + 1):
             if cancel_check():
@@ -2992,6 +4378,8 @@ def _run_case_explore(
                                               CASE_EXPLORE_READ_CHARS)
                 if tc.name in ("document_search", "memory_search"):
                     searches += 1
+                # 子代理工具调用纳入统一预算（B-02 §4.4）
+                _budget_spend(state, "tool_call")
                 try:
                     output: Any = _execute_tool(state, tc.name, tc_args, origin="subagent")
                 except task_store.TaskCancelled:
@@ -3050,13 +4438,31 @@ def _run_case_explore(
             ),
         }
         cache[question] = result_payload
+        try:
+            subagent_runs.finish(
+                run_id, status="staged", rounds_used=rounds,
+                tool_calls_used=searches + len(read_docs),
+            )
+        except Exception:  # noqa: BLE001 记录失败不影响调查结论
+            pass
         return result_payload
     except task_store.TaskCancelled:
         # 取消同样结算已消耗轮次，避免预算因异常路径被永久占用
         _explore_release(state, cap, rounds)
+        if run_id:
+            try:
+                subagent_runs.cancel(run_id, "用户停止任务")
+            except Exception:  # noqa: BLE001
+                pass
         raise
     except Exception as exc:
         _explore_release(state, cap, rounds)
+        if run_id:
+            try:
+                subagent_runs.finish(run_id, status="failed", rounds_used=rounds,
+                                     tool_calls_used=searches + len(read_docs))
+            except Exception:  # noqa: BLE001
+                pass
         return {"error": f"子代理执行失败：{exc}"}
 
 
@@ -3265,12 +4671,110 @@ def _execute_tool(
 ) -> Any:
     """执行一个工具并返回可 JSON 化的结果；异常向上抛（由主循环捕获回灌模型）。
 
-    call_id 为当前工具调用的 ID：子代理（case_explore）需要它把内部进度
-    （explore_progress）挂到外层工具条目上；其余工具忽略。
-    origin 区分主 Agent 与子 Agent 发起的调用，用于效率指标归因（§10.4 D4）。
+    统一执行路径（LB-HERMES-2026-01 §4.2）：所有调用经 `tool_runtime.run`，
+    V3 任务在真正执行前先落 Journal 并校验租约/fencing token；V1/V2 任务
+    直连实现，恢复语义与升级前完全一致。
     """
+    from . import tool_runtime
+
+    subagent_id = str(state.get("_subagent_id") or "") or None
+    return tool_runtime.run(
+        state, name, args or {},
+        lambda: _execute_tool_impl(state, name, args, call_id, origin=origin),
+        call_id=call_id, origin=origin, subagent_id=subagent_id,
+    )
+
+
+def _execute_tool_impl(
+    state: dict[str, Any], name: str, args: dict[str, Any], call_id: str = "",
+    *, origin: str = "main",
+) -> Any:
+    """工具实现（不含 Journal/租约；策略门禁由主循环与各分支自身完成）。"""
     case_id = str(state.get("case_id") or "")
     _count_tool_call(state, name)
+
+    if name == "tool_search":
+        # WP06 渐进披露：只检索「当前任务有权调用」的工具集合。
+        # 权限过滤必须先于相关性排序，否则模型能搜索到无权调用的工具。
+        from . import tool_registry
+
+        allowed = set(_allowed_tool_names(state))
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return {"error": "tool_search 需要 query（用中文描述你要做的事）"}
+        limit = max(1, min(_int_arg(args, "limit", 8), 20))
+        hits = tool_registry.search(query, allowed=allowed, limit=limit)
+        # 检索命中要附带调用方式：已直接下发的工具可直接调用，未下发的用 tool_call
+        direct = set(_eager_tool_names(state))
+        payload = [
+            {**h, "callVia": "direct" if h["name"] in direct else "tool_call"}
+            for h in hits
+        ]
+        result: dict[str, Any] = {"query": query, "tools": payload}
+        if not payload:
+            # 未命中时给出可用分类，避免模型反复空搜
+            result["categories"] = tool_registry.categories(allowed)
+            result["hint"] = "没有匹配工具：可换更具体的动词或名词，或直接使用已下发工具。"
+        return result
+
+    if name == "tool_describe":
+        from . import tool_registry
+
+        target = str(args.get("name") or "").strip()
+        if not target:
+            return {"error": "tool_describe 需要 name"}
+        allowed = set(_allowed_tool_names(state))
+        if target not in allowed:
+            # 不区分「不存在」与「无权」：统一提示，避免探测未授权能力
+            return {"error": f"工具 {target} 不在当前任务可用范围内；"
+                             "请先 tool_search 查看可调用工具"}
+        meta = tool_registry.get(target)
+        spec = next(
+            (s for s in _tool_specs()
+             if str(((s.get("function") or {}).get("name") or "")) == target),
+            None,
+        )
+        return {
+            "name": target,
+            "meta": {k: v for k, v in meta.public().items() if k != "name"},
+            "parameters": ((spec or {}).get("function") or {}).get("parameters") or {},
+        }
+
+    if name == "tool_call":
+        # 低频工具调用：仍走完整执行路径（策略/审批/Journal/预算），不建立旁路。
+        target = str(args.get("name") or "").strip()
+        inner = args.get("arguments")
+        if not target:
+            return {"error": "tool_call 需要 name"}
+        if target in ("tool_call", "tool_search", "tool_describe"):
+            return {"error": "不能在 tool_call 中嵌套调用工具发现类工具"}
+        allowed = set(_allowed_tool_names(state))
+        if target not in allowed:
+            return {"error": f"工具 {target} 不在当前任务可用范围内，已拒绝执行"}
+        if not isinstance(inner, dict):
+            return {"error": "tool_call 的 arguments 必须是对象"}
+        # 复用统一执行入口：Journal 归因到当前 call_id，避免同一轮出现两条并行登记
+        return _execute_tool(state, target, inner, call_id=call_id, origin=origin)
+
+    if name == "tool_batch":
+        # 受限批处理（WP07）：只读并行；写入/交付/Shell 整批拒绝。
+        from . import tool_batch
+
+        plan = args if isinstance(args, dict) else {}
+        seq = {"n": 0}
+
+        def _invoke(tool: str, inner: dict[str, Any]) -> Any:
+            # 子调用仍走统一执行入口（策略/审批/Journal/预算），批处理只做并发编排；
+            # call_id 带序号保证同一工具多次调用不会互相覆盖 Journal 登记。
+            seq["n"] += 1
+            return _execute_tool(
+                state, tool, inner, call_id=f"{call_id}:b{seq['n']}", origin=origin,
+            )
+
+        try:
+            return tool_batch.run(plan, _invoke)
+        except tool_batch.BatchRejected as exc:
+            return {"error": str(exc), "batchRejected": True}
 
     if name == "documents_list":
         from .. import documents
@@ -3286,6 +4790,17 @@ def _execute_tool(
         from .. import cases, search
 
         limit = _int_arg(args, "limit", 8)
+        raw_docs = args.get("documentIds")
+        doc_ids: tuple[str, ...] = ()
+        if isinstance(raw_docs, list):
+            wanted = [str(d) for d in raw_docs if str(d or "").strip()]
+            if wanted:
+                # 可读范围门禁：只接受本案（含显式关联案件）的材料 ID
+                allowed = {str(d.get("id")) for d in documents.list_task_documents(case_id)}
+                doc_ids = tuple(d for d in wanted if d in allowed)
+                if not doc_ids:
+                    return {"error": "documentIds 中没有本案可读的材料 ID，"
+                                     "请先用 documents_list 获取 ID"}
         raw_terms = args.get("queries")
         terms = [str(t) for t in raw_terms if str(t or "").strip()] if isinstance(raw_terms, list) else []
         if not terms:
@@ -3299,12 +4814,16 @@ def _execute_tool(
                     query,
                     limit,
                     extra_case_ids=tuple(cases.readable_case_ids(case_id)[1:]),
+                    document_ids=doc_ids,
                 ),
+                document_ids=doc_ids,
             )
         extra = tuple(cases.readable_case_ids(case_id)[1:])
         return _efficiency_search_multi(
             state, terms, origin, limit,
-            lambda term: search.search_pages(case_id, term, limit, extra_case_ids=extra),
+            lambda term: search.search_pages(
+                case_id, term, limit, extra_case_ids=extra, document_ids=doc_ids),
+            document_ids=doc_ids,
         )
 
     if name == "document_get_pages":
@@ -3372,6 +4891,9 @@ def _execute_tool(
             return _run_case_explore_many(state, questions, call_id)
         question = str(args.get("question") or "").strip() or (questions[0].strip() if questions else "")
         return _run_case_explore(state, question, call_id)
+
+    if name == "work_unit_run":
+        return _run_work_units(state, args)
 
     if name == "task_plan":
         steps = []
@@ -3779,11 +5301,99 @@ def _execute_tool(
             raise ValueError("技能不存在或已删除")
         return {"removed": True}
 
+    # 长输出合并校验（P2-10）：按主键合并各批片段并检查实体齐全/口径一致
+    if name == "merge_fragments_check":
+        from .. import long_output
+
+        fragments = args.get("fragments")
+        key_field = str(args.get("keyField") or "").strip()
+        if not isinstance(fragments, list) or not fragments:
+            raise ValueError("fragments 不能为空（把各批生成的结构化片段传进来）")
+        if not key_field:
+            raise ValueError("keyField 不能为空（实体主键字段名，如 defendant / name）")
+        path = args.get("path")
+        merged = long_output.merge_fragments(
+            fragments, key_field, path=[str(p) for p in path] if isinstance(path, list) else None,
+        )
+        expected = args.get("expectedEntities")
+        if not isinstance(expected, list) or not expected:
+            expected = _expected_entities(state)
+        report = long_output.validate_merged(
+            merged["merged"], key_field,
+            expected=expected if isinstance(expected, list) else None,
+            roles_field=str(args.get("rolesField") or "roles"),
+            charges_field=str(args.get("chargesField") or "charges"),
+        )
+        return {**merged, **report}
+
+    # 多选逐项核对（P2-09）：逐项要求可回查原文
+    if name == "options_check":
+        from .. import options_check
+
+        return options_check.check(args)
+
+    # 同族条款消歧（P1-08）：校验引用定义与题目主体是否同侧
+    if name == "clause_role_check":
+        from .. import clause_roles
+
+        return clause_roles.audit_document(
+            str(args.get("documentId") or ""),
+            str(args.get("quote") or ""),
+            str(args.get("subject") or ""),
+        )
+
+    # 跨文档聚合（P1-07）：机械求值，禁止模型心算
+    if name == "table_aggregate":
+        from .. import aggregate
+
+        from .. import sandbox as sandbox_mod
+
+        result = aggregate.aggregate(args, sandbox_mod.workspace_root())
+        # 记录本次声明的聚合规格与机械求值结果，供交付收尾做一致性门禁。
+        # 只记录模型自己声明的算子，不读取任何评分器内部规格。
+        specs = state.setdefault("_aggregate_runs", {})
+        for item in result.get("results") or []:
+            qid = str(item.get("id") or "")
+            spec = next(
+                (q for q in (args.get("questions") or []) if str(q.get("id") or "") == qid),
+                None,
+            )
+            if qid and spec is not None and "error" not in item:
+                specs[qid] = {
+                    "spec": dict(spec),
+                    "value": item.get("value"),
+                    "tablePath": result.get("tablePath"),
+                    "agreements": result.get("agreements"),
+                    "dealPoints": args.get("dealPoints") or {},
+                    "options": args.get("options") or {},
+                }
+        return result
+
+    # 交付回写（P0-04）：只允许写本次任务声明过的交付物，内容按主键 upsert
+    if name == "deliverable_patch":
+
+        from .. import sandbox as sandbox_mod
+
+        from . import deliverables as deliverable_store
+
+        specs = _deliverable_specs(state)
+        if not specs:
+            return {
+                "error": "本次任务未声明交付物，无需回写；请直接在回答中给出结论",
+            }
+        result = deliverable_store.patch(
+            sandbox_mod.workspace_root(), specs, args.get("name"), args,
+        )
+        # 产物即时登记（B-03 §4.6 第 6 条）：每次回写后立刻重读校验并登记，
+        # 不等任务结束统一扫描——中断点上的交付状态也必须真实
+        _sync_artifact_after_write(state, args.get("name"))
+        return result
+
     # 沙箱工作空间工具（read/write/edit/glob/grep/bash），见 sandbox.py
     if name in _SANDBOX_TOOLS:
-        from .. import sandbox
+        from .. import sandbox as sandbox_mod
 
-        return sandbox.execute_tool(state, name, args)
+        return sandbox_mod.execute_tool(state, name, args)
 
     raise ValueError(f"未知工具：{name}")
 
@@ -3857,6 +5467,15 @@ def _fast_path_eligible(state: dict[str, Any]) -> bool:
         return False
     if state.get("skills"):
         return False
+    # 声明了交付契约的任务必须走完整循环（骨架已建，需真实回写内容）
+    if _deliverable_specs(state):
+        return False
+    # 需要工具才能做对的任务不能走直答通道（P1-08 / P2-09 / P2-10）：
+    # 同族条款消歧要调 clause_role_check 回查原文，多选要 options_check 逐项取证，
+    # 多实体长输出要分批 + 合并校验。直答通道没有工具，会把这类任务降级成
+    # 凭上下文猜答案——正是优化方案要消除的失败模式。
+    if _needs_role_disambiguation(state) or _needs_option_check(state) or _needs_batched_output(state):
+        return False
     request = str(state.get("request") or "").strip()
     if not request or len(request) > FAST_PATH_MAX_REQUEST_CHARS:
         return False
@@ -3927,6 +5546,18 @@ def run_autonomous(
         skill_details = skill_store.get_skills(skill_ids)
     state["skill_details"] = skill_details
 
+    # 交付骨架（P0-04）：任务启动即落盘，保证任何时刻中断都有可解析交付物
+    _ensure_deliverable_skeletons(state, emit)
+
+    # 工作账本（B-01/B-02）：编译工作全集并登记运行时版本与计数。
+    # 只登记契约与计数，不生成任何法律结论；重复执行幂等（HAR-T-001）。
+    _seed_work_ledger(state, emit)
+    # 语料版本戳：检索缓存键的一部分，文档换版后旧缓存自然失效（HAR-T-012）
+    state["_corpus_stamp"] = _corpus_stamp(state)
+    # 旧阅读、旧证据与旧答案按当前活动版本统一失效（B-02 §4.7）
+    _invalidate_stale_state(state, emit)
+    _budget_attach(state, emit)
+
     # 案件上下文准备（升级方案 §8.1）：每次执行/续跑都重新读取材料与版本，
     # 不沿用旧上下文包——材料换版后不得把失效引用当成已支持事实。
     # 只记录计数类元数据到事件，不写原文或个人信息。
@@ -3984,15 +5615,20 @@ def run_autonomous(
     empty_rounds = 0
     tool_calls_total = 0                 # 本次任务累计工具调用次数（受 MAX_TOOL_CALLS 约束）
     bash_timeout_streaks: dict[str, int] = {}  # 规范化命令 → 连续超时次数
+    # 断点续写（P2-10）：已生成但因断连未完成的部分，与续写次数
+    resume_prefix = ""
+    resume_attempts = 0
     started = time.monotonic()
 
     # 任务契约（§5.3）：续跑沿用检查点里已推导的契约，首轮现推
     state["task_contract"] = state.get("task_contract") or _derive_task_contract(state)
-    # 固定上限：旧检查点里遗留的轮数预算一并刷新为当前值
+    # 任务级预算覆盖优先（B-02 §4.4）：用户显式给的轮次/工具上限必须生效
+    task_budget = state.get("budget_overrides") or {}
+    max_rounds = int(task_budget.get("maxRounds") or MAX_ROUNDS)
+    max_tool_calls = int(task_budget.get("maxToolCalls") or MAX_TOOL_CALLS)
     contract = state["task_contract"]
-    contract.setdefault("budget", {})["maxRounds"] = MAX_ROUNDS
-    contract["budget"]["toolCalls"] = MAX_TOOL_CALLS
-    max_rounds = MAX_ROUNDS
+    contract.setdefault("budget", {})["maxRounds"] = max_rounds
+    contract["budget"]["toolCalls"] = max_tool_calls
     state.setdefault("reading_ledger", {})
     state.setdefault("evidence_ledger", {})
     state.setdefault("issue_ledger", {})
@@ -4013,21 +5649,69 @@ def run_autonomous(
                 raise task_store.TaskCancelled("用户停止")
             rounds = round_no
             state["_round"] = round_no
+            # 统一预算记账（B-02）：轮次随主循环推进，续跑时从 task_budget 连续累计
+            _budget_spend(state, "round")
+            # 预算阶段变化时推送事件（B-05）：UI 据此展示已用/上限与降级原因
+            _emit_budget_update(state, emit)
+
+            # 交付回写提示（P0-04）：每 N 轮注入一次；进入收尾模式后每轮都提示，
+            # 保证预算耗尽前已确认的结论已落盘，而不是全部留在上下文里蒸发
+            wrap_up = _wrap_up_mode(
+                round_no, max_rounds, tool_calls_total, max_tool_calls,
+                int(state.get("_delivery_reserved") or 0),
+            )
+            if wrap_up != bool(state.get("_wrap_up")):
+                state["_wrap_up"] = wrap_up
+                if wrap_up:
+                    emit("deliverable_wrap_up", {
+                        "round": round_no,
+                        "toolCallsUsed": tool_calls_total,
+                    })
+            if _deliverable_specs(state) and (
+                round_no % DELIVERABLE_PATCH_INTERVAL == 0
+                or (wrap_up and round_no % WRAP_UP_HINT_INTERVAL == 0)
+            ):
+                _inject_deliverable_hint(messages, state, round_no, wrap_up=wrap_up)
 
             # ---- 上下文窗口管理（每轮模型调用前） ----
-            # 1) 历史超阈值时压缩早期轮次（确定性摘要，不额外调模型）：
-            #    控制 prompt 体积 → TTFT 与费用回落，长任务不再被上下文拖垮
+            # 1) 历史超阈值时做引证安全压缩（WP04）：
+            #    - 默认走 context_compaction（归档 + CAS + 超大工具结果转内容引用
+            #      + 导航摘要）；`agent.contextCompressionV2` 关闭时回退旧确定性压缩，
+            #      但归档与 CAS 仍然生效，避免并发压缩互相覆盖。
+            #    - 压缩失败/冲突一律保留未压缩消息继续，绝不半写入或越压越大。
             if len(messages) > CONTEXT_KEEP_RECENT_MSGS + 2 and \
                     _messages_chars(messages) > CONTEXT_COMPACT_THRESHOLD_CHARS:
-                messages, cstats = _compact_messages(messages)
-                emit("compaction", cstats)
+                from . import context_compaction as compaction
+
+                use_v2 = _setting_bool("agent.contextCompressionV2", True)
+                if use_v2:
+                    cres = compaction.compact(state, messages)
+                    messages = cres["messages"]
+                    emit("compaction", compaction.stats_for_event(cres))
+                else:
+                    archived = None
+                    try:
+                        archived = compaction.archive_transcript(
+                            str(state.get("task_id") or ""), messages, reason="legacy_compaction",
+                        )
+                    except Exception:  # noqa: BLE001 归档失败不阻断旧压缩路径
+                        archived = None
+                    messages, cstats = _compact_messages(messages)
+                    emit("compaction", {
+                        **cstats,
+                        "archiveId": (archived or {}).get("archiveId"),
+                        "applied": True, "reason": "legacy",
+                    })
             # 2) 任务清单段与状态摘要重装进 system（最新进度每轮可见；无清单时还原基础提示）
-            #    状态摘要来自账本而非历史消息，压缩/恢复后依然成立（§6.4）
+            #    状态摘要来自账本而非历史消息，压缩/恢复后依然成立（§6.4）；
+            #    B-04 起改由 context_builder 统一组装：稳定前缀不变（利于前缀缓存），
+            #    动态状态与当前工作单元单独追加，未提交格/合法选项/失败原因不依赖摘要保存
             base_system = str(state.get("_system_base") or "")
             if messages and messages[0].get("role") == "system" and base_system:
-                messages[0] = {"role": "system", "content": base_system
-                               + _plan_section(state.get("task_plan"))
-                               + _ledger_summary(state)}
+                messages[0] = {
+                    "role": "system",
+                    "content": _compose_system(messages[0], state, base_system),
+                }
 
             throttle = _TextThrottle(emit)
             # 工具参数生成进度（大参数如 render_html 可流式生成数十秒，不上报会被误认为卡死）：
@@ -4064,6 +5748,9 @@ def run_autonomous(
             stage_trace.append(stage)
 
             result: dict[str, Any] | None = None
+            # 并发闸门（B-04）：与工作型子代理共用同一并发上限与熔断状态。
+            # 主循环本身不抢子代理名额（子代理在自己的线程里 acquire），这里只做
+            # 失败反馈——429/超时/断连会降低全局并发并触发冷却。
             try:
                 result = model_gateway.chat_with_tools(
                     # 随问附件在请求层并入首条 user 消息（messages 原序列保持纯文本）
@@ -4076,6 +5763,42 @@ def run_autonomous(
                     cancel_check=check,
                     reasoning_effort=effort,
                 )
+            except model_gateway.StreamInterrupted as exc:
+                # 长输出中途断连（P2-10 §4.7）：已生成部分保留，按"续写"重试，
+                # 而不是整轮丢弃重来（12 被告这类长结构化输出重来成本极高）
+                _gate_feedback(state, exc)
+                if getattr(exc, "partial_tool_calls", 0):
+                    # 工具参数断连（HAR-T-009）：已收到的调用参数不完整，一律丢弃，
+                    # 整轮重试；绝不按缺参执行工具，也不把半截调用回灌成空批次。
+                    empty_rounds += 1
+                    emit("text", {"delta": (
+                        f"\n> ⚠ 工具参数在生成中断连（已收到部分参数的调用 {exc.partial_tool_calls} 个），"
+                        "这些调用已全部丢弃并重新生成，不会按不完整参数执行。\n\n")})
+                    if empty_rounds >= MAX_PARTIAL_CALL_RETRIES:
+                        raise
+                    messages.append({
+                        "role": "user",
+                        "content": "上一轮工具调用参数在生成中断连，已整体丢弃。"
+                                   "请重新给出完整工具调用（参数一次写全），或直接输出结论。",
+                    })
+                    continue
+                if not exc.resumable or resume_attempts >= MAX_RESUME_ATTEMPTS:
+                    raise
+                resume_attempts += 1
+                partial = _restore_dialogue(state, exc.received)
+                # 断点续写累积：下一轮若正常结束，把已写部分接回正文；
+                # 若再次中断则继续累加（不丢已生成内容）
+                resume_prefix += partial
+                emit("text", {
+                    "delta": f"\n> ⚠ 输出中断（{type(exc).__name__}），已保留 {len(partial)} 字，正在续写…\n\n",
+                })
+                messages.append({"role": "assistant", "content": partial})
+                messages.append({
+                    "role": "user",
+                    "content": "上一条回答在生成中被网络中断。请紧接着已输出的末尾继续写："
+                               "不要重复已写内容，不要重新开头，不要加任何说明，直接从断点续写剩余部分。",
+                })
+                continue
             except model_gateway.ReasoningRunaway as exc:
                 # 思考失控熔断（model_gateway.REASONING_RUNAWAY_CHARS）：不等烧满
                 # max_tokens，立即降档重试（与下方空回答守卫同一套降级语义）；
@@ -4093,16 +5816,27 @@ def run_autonomous(
                 downgraded = True
                 continue
             throttle.flush()
+            _gate_feedback(state, None)  # 本轮模型调用成功：放开并发、清熔断计数
 
             usage = result.get("usage") or {}
             usage_total["promptTokens"] += int(usage.get("promptTokens") or 0)
             usage_total["completionTokens"] += int(usage.get("completionTokens") or 0)
+            # 模型调用与 Token 记账（B-02）：与轮次分开计，恢复后仍可查
+            _budget_spend(
+                state, "model_call",
+                tokens=int(usage.get("promptTokens") or 0) + int(usage.get("completionTokens") or 0),
+            )
 
             content = str(result.get("content") or "")
             tool_calls = list(result.get("toolCalls") or [])
             content = _restore_dialogue(state, content)
             for call in tool_calls:
                 call.arguments = _restore_dialogue(state, call.arguments)
+            # 断点续写（P2-10）：前序中断已生成的部分接回本轮正文，保持交付完整
+            if resume_prefix:
+                content = resume_prefix + content
+                resume_prefix = ""
+                resume_attempts = 0
             # 中间文本（interim text）不等于最终答案：本轮同时发起工具调用时，
             # 这段文字只是过程说明，不能当作终答（否则轮数耗尽时会被误认为已作答，
             # §7.3 最后一条）；此时 answer 保持空串，收尾会走强制作答
@@ -4167,24 +5901,37 @@ def run_autonomous(
                 emit("tool_use_start", {"callId": tc.id, "name": tc.name, "arguments": tool_args})
                 # bash 超时熔断：同一命令连续超时达上限后直接拒绝执行，强制换策略
                 cmd_key = " ".join(str((tool_args or {}).get("command") or "").split()) if tc.name == "bash" else ""
-                if tool_calls_total > MAX_TOOL_CALLS:
+                if tool_calls_total > max_tool_calls:
                     # 累计工具调用超限：不再执行，但仍回灌配对的 tool 消息
                     #（OpenAI 协议要求每个 tool_call 都有响应，缺失会破坏后续请求）
                     output = {
                         "denied": True,
                         "message": (
-                            f"本次任务累计工具调用已达上限（{MAX_TOOL_CALLS} 次），本次调用不再执行。"
+                            f"本次任务累计工具调用已达上限（{max_tool_calls} 次），本次调用不再执行。"
                             "请立即基于已获得的信息输出最终回答，并列出尚未完成/待核实事项。"
                         ),
                     }
                     status = "ok"
                     tool_budget_exhausted = True
                 else:
+                    _budget_spend(state, "tool_call")
                     try:
                         permitted = {spec["function"]["name"] for spec in tools}
                         if tc.name not in permitted:
                             raise ValueError("该工具不在当前模式和任务的允许范围")
-                        if cmd_key and bash_timeout_streaks.get(cmd_key, 0) >= BASH_TIMEOUT_STREAK_LIMIT:
+                        if state.get("_wrap_up") and tc.name in _WRAP_UP_BLOCKED_TOOLS:
+                            # 收尾模式（P0-04）：预算将尽，禁止再新开检索/整卷阅读，
+                            # 只允许回写交付物与产出结论，保证有交付而非零产出
+                            output = {
+                                "denied": True,
+                                "message": (
+                                    "已进入收尾模式（预算即将耗尽）：不再允许新的检索或通读。"
+                                    "请用 deliverable_patch 把已确认的内容写回交付物，"
+                                    "然后输出最终回答（已完成结论 + 未完成/待核实事项）。"
+                                ),
+                            }
+                            status = "ok"
+                        elif cmd_key and bash_timeout_streaks.get(cmd_key, 0) >= BASH_TIMEOUT_STREAK_LIMIT:
                             output = {
                                 "denied": True,
                                 "message": (
@@ -4255,13 +6002,44 @@ def run_autonomous(
                 "issueLedger": state.get("issue_ledger") or {},
                 "ledgerSchemaVersion": LEDGER_SCHEMA_VERSION,
                 "repairRoundsLeft": repair_rounds_left,
+                # 预算恢复语义（B-02 §4.4）：五类计数全部落检查点，
+                # 续跑时按快照续接，不重新获得预算
                 "budget": {
                     "roundsUsed": round_no,
                     "maxRounds": max_rounds,
                     "toolCallsUsed": tool_calls_total,
+                    "modelCallsUsed": int(state.get("_model_calls_used") or 0),
+                    "promptTokens": usage_total["promptTokens"],
+                    "completionTokens": usage_total["completionTokens"],
                     "exploreRoundsUsed": int(state.get("_explore_rounds_used") or 0),
+                    "deliveryReservedRounds": int(state.get("_delivery_reserved") or 0),
+                },
+                "runtimeVersion": str(state.get("_runtime_version") or "v1"),
+                "efficiency": {
+                    "searches": int(_efficiency(state)["searches"]),
+                    "duplicateSearches": int(_efficiency(state)["duplicateSearches"]),
+                    "emptySearches": int(_efficiency(state)["emptySearches"]),
+                    "repeatedReads": int(_efficiency(state)["repeatedReads"]),
+                    "repeatedReadPages": int(_efficiency(state)["repeatedReadPages"]),
+                    "readsByOrigin": dict(_efficiency(state)["readsByOrigin"]),
+                    "searchesByOrigin": dict(_efficiency(state)["searchesByOrigin"]),
+                    "toolCalls": dict(_efficiency(state)["toolCalls"]),
                 },
             })
+            # 运行时账本旁写：与检查点同一轮落库，恢复时二者取最大值（幂等）
+            try:
+                from . import work_ledger
+
+                work_ledger.save_runtime(task_id, {
+                    "roundsUsed": int(round_no),
+                    "toolCallsUsed": tool_calls_total,
+                    "modelCallsUsed": int(state.get("_model_calls_used") or 0),
+                    "promptTokens": usage_total["promptTokens"],
+                    "completionTokens": usage_total["completionTokens"],
+                    "exploreRoundsUsed": int(state.get("_explore_rounds_used") or 0),
+                }, {"lastCheckpoint": f"round_{round_no}"})
+            except Exception:  # noqa: BLE001 账本旁写失败不影响检查点语义
+                pass
             # 累计工具调用超限：本轮剩余调用已按拒绝回灌，保存检查点后收束循环
             if tool_budget_exhausted:
                 reason = "max_tool_calls"
@@ -4360,6 +6138,44 @@ def run_autonomous(
             "coverage": _reading_coverage(state, state.get("task_contract") or {}),
         }
     verification: dict[str, Any] = gate_result["verification"]
+    # 交付缺口并入完成守门（B-03 §4.6 第 5 条）：交付不完整时不得显示全部完成
+    delivery_preview = _finalize_delivery(state, emit) if reason != "waiting_human" else {
+        "status": "pending", "artifacts": [], "gaps": []}
+    for gap in delivery_preview.get("gaps") or []:
+        gate_result["warnings"].append({
+            "code": "DELIVERY_INCOMPLETE",
+            "text": f"交付物未完整覆盖：{gap.get('artifact')}（状态 {gap.get('status')}，"
+                    f"缺行 {int(gap.get('missingRows') or 0)}，非法值 {int(gap.get('invalidCells') or 0)}）",
+            "files": [str(gap.get("artifact"))],
+        })
+    if delivery_preview.get("gaps"):
+        gate_result["ok"] = False
+    # 结构完整但仍有未终态答案格时也必须视为未完成：只报文件齐全等于把
+    # 「文件骨架已生成」当成「工作已做完」（方案 §1.1-7 / §4.6-5）。
+    # 计数在 delivery_controller.finalize 的 progress 段里，不在顶层。
+    pending_cells = int((delivery_preview.get("progress") or {}).get("cellsPending") or 0)
+    if delivery_preview.get("workDone") is False and pending_cells:
+        gate_result["warnings"].append({
+            "code": "WORK_UNITS_PENDING",
+            "text": f"仍有 {pending_cells} 个答案格未进入终态（已提交/待核实/阻塞），"
+                    "交付物结构完整但工作尚未完成",
+            "cellsPending": pending_cells,
+        })
+        gate_result["ok"] = False
+    # 聚合一致性门禁（P1-07 收尾）：模型调用过 table_aggregate 的题，答案必须
+    # 与机械求值一致；不一致或缺失一律标为待人工核实，不放行「全部完成」。
+    if reason != "waiting_human":
+        for gap in _aggregate_consistency_gaps(state):
+            gate_result["warnings"].append({
+                "code": "AGGREGATE_INCONSISTENT",
+                "text": f"聚合题 {gap['questionId']} 的答案与表格机械求值不一致"
+                        f"（提交 {gap['submitted']!r}，应为 {gap['expected']!r}）："
+                        f"{gap['reason']}；请重算或标为待核实",
+                "questionId": gap["questionId"],
+                "expected": gap["expected"],
+                "submitted": gap["submitted"],
+            })
+            gate_result["ok"] = False
     if answer.strip():
         if verification["pending"]:
             appendix = "\n\n> ⚠ 以下引用未能回查原文，待人工核实：\n" + "\n".join(
@@ -4409,12 +6225,16 @@ def run_autonomous(
             pass
 
     # 收尾清单兜底：已交付最终结论（正常作答，或轮数耗尽后强制生成的实质回答）时，
-    # 把仍停在 pending 的步骤收口为 done，避免 UI 停在「0/6 个任务已完成」与已交付
-    # 结论矛盾；空回答等未真正作答的收束不收口，保留真实缺口
-    if reason == "final_answer" or forced_final:
+    # 把仍停在 pending 的步骤收口为 done；但交付物未完整覆盖时保留真实缺口，
+    # 不把「交付不完整」显示成「全部完成」（B-03 §4.6 第 5 条）
+    if (reason == "final_answer" or forced_final) and not delivery_preview.get("gaps") \
+            and delivery_preview.get("workDone") is not False:
         _close_out_plan(state, emit)
 
     coverage = gate_result.get("coverage") or {}
+    # 交付控制器（B-03）：逐交付物原子提交 + 写后校验 + 派生聚合，登记产物。
+    # 收尾只汇总真实状态，不因交付不完整而伪报完成。
+    delivery = delivery_preview
     emit("turn_complete", {
         "rounds": rounds,
         "reason": reason,
@@ -4427,6 +6247,10 @@ def run_autonomous(
         "reasoningStageTrace": stage_trace,
         # 效率指标（§4.2 / §10.4 D4）：重复读取、无效检索、子 Agent 采用率
         "efficiency": _efficiency_summary(state),
+        # 交付状态与工作进度（B-05）：数值直接来自工作账本，不由模型文本推断
+        "delivery": delivery,
+        "workProgress": _work_progress(state),
+        "budget": _budget_snapshot(state),
         "finalize": {
             "ok": bool(gate_result["ok"]),
             "taskDepth": str((state.get("task_contract") or {}).get("taskDepth") or ""),
@@ -4441,4 +6265,15 @@ def run_autonomous(
         },
     })
     return {"answer": answer, "rounds": rounds, "usage": usage_total,
-            "finalize": gate_result, "reason": reason}
+            "finalize": gate_result, "reason": reason,
+            "journal": tool_runtime_journal_snapshot(state)}
+
+
+def tool_runtime_journal_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    """V3 任务收尾时的 Journal 摘要（非 V3 返回 {"enabled": False}）。"""
+    try:
+        from . import tool_runtime
+
+        return tool_runtime.journal_snapshot(state)
+    except Exception:  # noqa: BLE001 摘要失败不影响任务结论
+        return {"enabled": False}

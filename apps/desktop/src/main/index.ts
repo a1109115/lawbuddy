@@ -1001,6 +1001,97 @@ function registerIpc(): void {
   ipcMain.handle('agent:getPendingQuestions', (_e, req: { taskId: string }) =>
     requireCore().rpc('agent.pending_questions', { taskId: req?.taskId })
   )
+  // ---- 运行时底座（WP01/WP03：Journal、unknown 处置、Span 与诊断） -------------
+  ipcMain.handle('agent:runtimeStatus', (_e, taskId: string) =>
+    requireCore().rpc('agent.runtime_status', { taskId })
+  )
+  ipcMain.handle(
+    'agent:toolJournal',
+    (_e, req: { taskId: string; status?: string; limit?: number }) =>
+      requireCore().rpc('agent.tool_journal', {
+        taskId: req?.taskId,
+        status: req?.status,
+        limit: req?.limit
+      })
+  )
+  ipcMain.handle(
+    'agent:resolveToolCall',
+    (_e, req: { taskId: string; journalId: string; action: string }) =>
+      requireCore().rpc('agent.resolve_tool_call', req)
+  )
+  ipcMain.handle('agent:trace', (_e, req: { taskId: string; traceId?: string }) =>
+    requireCore().rpc('agent.trace', { taskId: req?.taskId, traceId: req?.traceId })
+  )
+  ipcMain.handle('agent:budgetReservations', (_e, req: { taskId: string }) =>
+    requireCore().rpc('agent.budget_reservations', { taskId: req?.taskId })
+  )
+  ipcMain.handle('agent:subagentRuns', (_e, req: { taskId: string; limit?: number }) =>
+    requireCore().rpc('agent.subagent_runs', { taskId: req?.taskId, limit: req?.limit })
+  )
+  ipcMain.handle('agent:recoveryCenter', (_e, req?: { caseId?: string }) =>
+    requireCore().rpc('agent.recovery_center', req ?? {})
+  )
+  ipcMain.handle('agent:releaseSubagentBudget', (_e, req: { taskId: string; ownerId: string }) =>
+    requireCore().rpc('agent.release_subagent_budget', req)
+  )
+  ipcMain.handle('diagnostics:snapshot', () => requireCore().rpc('diagnostics.snapshot', {}))
+  // 诊断导出（§7.7）：Core 只产出技术字段，Main 负责弹窗与落盘；不含原文与密钥
+  ipcMain.handle('diagnostics:export', async (): Promise<{ fileName: string; sizeBytes: number } | null> => {
+    const win = mainWindow
+    if (!win || win.isDestroyed()) return null
+    const lastExportDir = lastDialogDirs.get('export-dir')
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+    const defaultName = `lawbuddy-diagnostics-${stamp}.json`
+    const { canceled, filePath } = await dialog.showSaveDialog(win, {
+      title: '导出诊断包',
+      defaultPath: lastExportDir ? join(lastExportDir, defaultName) : defaultName,
+      filters: [{ name: 'JSON', extensions: ['json'] }]
+    })
+    if (canceled || !filePath) return null
+    const payload = await requireCore().rpc('diagnostics.export', {})
+    const data = Buffer.from(JSON.stringify(payload, null, 2), 'utf-8')
+    await writeFile(filePath, data)
+    rememberDialogDir('export-dir', filePath, false)
+    return { fileName: basename(filePath), sizeBytes: data.byteLength }
+  })
+  ipcMain.handle('agent:compactionArchive', (_e, req: { taskId: string; archiveId: string }) =>
+    requireCore().rpc('agent.compaction_archive', req)
+  )
+  ipcMain.handle('model:health', () => requireCore().rpc('model.health', {}))
+  ipcMain.handle('model:conformance', (_e, req?: { providerId?: string }) =>
+    requireCore().rpc('model.conformance', req ?? {})
+  )
+
+  // ---- 会话管理（WP05：搜索 / 分支 / 彻底删除 / 产物快照） ---------------------
+  ipcMain.handle('conversation:list', (_e, req: { caseId: string; limit?: number }) =>
+    requireCore().rpc('conversation.list', req)
+  )
+  ipcMain.handle(
+    'conversation:search',
+    (_e, req: { caseId: string; query: string; conversationId?: string; limit?: number }) =>
+      requireCore().rpc('conversation.search', req)
+  )
+  ipcMain.handle(
+    'conversation:branch',
+    (_e, req: { conversationId: string; anchorMessageId?: string }) =>
+      requireCore().rpc('conversation.branch', req)
+  )
+  ipcMain.handle('conversation:delete', (_e, req: { conversationId: string }) =>
+    requireCore().rpc('conversation.delete', req)
+  )
+  ipcMain.handle(
+    'conversation:snapshots',
+    (_e, req: { caseId: string; name?: string; limit?: number }) =>
+      requireCore().rpc('conversation.snapshots', req)
+  )
+  ipcMain.handle(
+    'conversation:rollback',
+    (_e, req: { snapshotId: string; caseId: string; targetPath: string }) =>
+      requireCore().rpc('conversation.rollback', req)
+  )
+  ipcMain.handle('conversation:stats', (_e, req: { caseId: string }) =>
+    requireCore().rpc('conversation.stats', req)
+  )
 
   // ---- 设置（模型 API Key 等） ------------------------------------------------
 
@@ -1580,6 +1671,82 @@ function registerIpc(): void {
   ipcMain.handle('skill:remove', (_e, req: { skillId: string }) =>
     requireCore().rpc('skill.remove', req)
   )
+
+  // ---- 技能生命周期（WP09：暂存 / 扫描 / 版本 / 回滚） -------------------------
+  ipcMain.handle('skill:staging', (_e, req?: { status?: string; limit?: number }) =>
+    requireCore().rpc('skill.staging', req ?? {})
+  )
+  ipcMain.handle('skill:stage', (_e, req: Record<string, unknown>) =>
+    requireCore().rpc('skill.stage', req)
+  )
+  ipcMain.handle('skill:stagingDetail', (_e, req: { stagingId: string }) =>
+    requireCore().rpc('skill.staging_detail', req)
+  )
+  ipcMain.handle('skill:approveStaging', (_e, req: { stagingId: string; note?: string }) =>
+    requireCore().rpc('skill.approve_staging', req)
+  )
+  ipcMain.handle('skill:rejectStaging', (_e, req: { stagingId: string; note?: string }) =>
+    requireCore().rpc('skill.reject_staging', req)
+  )
+  ipcMain.handle('skill:versions', (_e, req: { skillId: string }) =>
+    requireCore().rpc('skill.versions', req)
+  )
+  ipcMain.handle(
+    'skill:diff',
+    (_e, req: { skillId: string; fromVersion: number; toVersion: number }) =>
+      requireCore().rpc('skill.diff', req)
+  )
+  ipcMain.handle('skill:rollback', (_e, req: { skillId: string; versionNo: number; note?: string }) =>
+    requireCore().rpc('skill.rollback', req)
+  )
+
+  // ---- 学习提案（WP08：批准后才生效） -----------------------------------------
+  ipcMain.handle(
+    'learning:proposals',
+    (_e, req?: { caseId?: string; status?: string; limit?: number }) =>
+      requireCore().rpc('learning.proposals', req ?? {})
+  )
+  ipcMain.handle('learning:approve', (_e, req: { proposalId: string; note?: string }) =>
+    requireCore().rpc('learning.approve', req)
+  )
+  ipcMain.handle('learning:reject', (_e, req: { proposalId: string; note?: string }) =>
+    requireCore().rpc('learning.reject', req)
+  )
+  ipcMain.handle('learning:rollback', (_e, req: { proposalId: string; note?: string }) =>
+    requireCore().rpc('learning.rollback', req)
+  )
+
+  // ---- 受限本地自动化（M8：只读检查，无外发、无后台定时器） -------------------
+  ipcMain.handle('automation:status', () => requireCore().rpc('automation.status', {}))
+  ipcMain.handle(
+    'automation:run',
+    (_e, req: { caseId: string; actions?: string[] }) => requireCore().rpc('automation.run', req)
+  )
+
+  // ---- 插件 / MCP / 执行后端（WP10：默认全部禁用） ----------------------------
+  ipcMain.handle('plugin:status', () => requireCore().rpc('plugin.status', {}))
+  ipcMain.handle('plugin:list', (_e, req?: { includeDisabled?: boolean }) =>
+    requireCore().rpc('plugin.list', req ?? {})
+  )
+  ipcMain.handle('plugin:review', (_e, req: { manifest: string }) =>
+    requireCore().rpc('plugin.review', req)
+  )
+  ipcMain.handle('plugin:install', (_e, req: { manifest: string }) =>
+    requireCore().rpc('plugin.install', req)
+  )
+  ipcMain.handle(
+    'plugin:enable',
+    (_e, req: { pluginId: string; grantedCapabilities?: string[] }) =>
+      requireCore().rpc('plugin.enable', req)
+  )
+  ipcMain.handle('plugin:disable', (_e, req: { pluginId: string }) =>
+    requireCore().rpc('plugin.disable', req)
+  )
+  ipcMain.handle('plugin:uninstall', (_e, req: { pluginId: string }) =>
+    requireCore().rpc('plugin.uninstall', req)
+  )
+  ipcMain.handle('plugin:mcpServers', () => requireCore().rpc('mcp.servers', {}))
+  ipcMain.handle('plugin:mcpShutdown', () => requireCore().rpc('mcp.shutdown', {}))
 }
 
 // 单实例锁（DB-010）：第二实例直接退出，避免两个 Core 同时写同一个 SQLite 库

@@ -443,8 +443,84 @@ export interface AgentTaskInfo {
   workflowPreset: 'review_analysis' | 'visualization' | 'evidence_analysis' | 'strategy' | null
   modelPolicy: Record<string, unknown>
   toolPolicy: Record<string, unknown>
+  /** 交付契约（P0-04）：任务声明的交付物（空 = 未启用交付骨架） */
+  deliverables: AgentDeliverableSpec[]
+  /** 运行状态（B-05）：来自工作账本与预算，不由模型文本推断 */
+  runtimeVersion?: 'v1' | 'v2' | 'v3' | 'legacy'
+  /** 交付状态（B-05）：complete 全部行覆盖；partial 有内容未覆盖；pending 未开始 */
+  deliveryStatus?: 'pending' | 'partial' | 'complete' | 'invalid'
+  /** 工作进度（B-05）：工作单元/答案格/交付物的真实计数 */
+  workProgress?: AgentWorkProgress | null
+  /** 预算进度（B-05） */
+  budgetProgress?: AgentBudgetProgress | null
   createdAt: string
   finishedAt: string | null
+}
+
+/** 工作单元进度（B-05）：只含状态与数量，不含案件原文 */
+export interface AgentWorkUnitProgress {
+  total: number
+  committed: number
+  needsHuman: number
+  blocked: number
+  pending: number
+  inProgress: number
+  terminal: number
+  terminalRatio: number
+  byStatus: Record<string, number>
+}
+
+/** 答案格进度（B-05） */
+export interface AgentCellProgress {
+  total: number
+  committed: number
+  needsHuman: number
+  blocked: number
+  stale: number
+  pending: number
+  byStatus: Record<string, number>
+}
+
+/** 交付进度（B-05）：文件级状态 + 行覆盖 */
+export interface AgentDeliveryProgress {
+  /** 结构 + 工作终态的综合状态：结构完整但答案格未终态时为 partial */
+  status: 'pending' | 'partial' | 'complete' | 'invalid'
+  /** 仅结构完整性（文件存在/可解析/行全集齐全） */
+  structuralStatus?: 'pending' | 'partial' | 'complete' | 'invalid'
+  /** 答案格是否全部进入终态（committed / needs_human / blocked） */
+  workDone?: boolean
+  terminalRatio?: number
+  cellsPending?: number
+  artifactCount: number
+  completeCount: number
+  incomplete: string[]
+  rowsExpected: number
+  rowsCommitted: number
+  rowCoverage: number
+}
+
+/** 当前工作单元（B-05） */
+export interface AgentCurrentWorkUnit {
+  workUnitId: string
+  scopeType: string
+  attempts: number
+}
+
+/** 工作进度总览（B-05）：全部数值来自工作账本 */
+export interface AgentWorkProgress {
+  units: AgentWorkUnitProgress
+  cells: AgentCellProgress
+  delivery: AgentDeliveryProgress
+  currentUnit: AgentCurrentWorkUnit | null
+}
+
+/** 预算进度（B-05）：已用/上限/阶段，不含内容 */
+export interface AgentBudgetProgress {
+  stage: 'ok' | 'warn' | 'blocked' | string
+  limits: Record<string, number>
+  used: Record<string, unknown>
+  reasons: string[]
+  deliveryReservedRounds?: number
 }
 
 /** 任务事件（单调递增 seq，getEvents(afterSeq) 增量续订） */
@@ -484,6 +560,18 @@ export interface AgentTaskEvent {
     | 'human_answer' | 'task_resumed'
     /** 文书生成案件上下文准备完成（只含计数元数据，不含原文） */
     | 'case_context'
+    /** 交付物骨架已生成（P0-04：仅文件名与是否新建，不含内容） */
+    | 'deliverable_skeleton'
+    /** 进入收尾模式（P0-04：预算将尽，停止新检索、仅回写交付物） */
+    | 'deliverable_wrap_up'
+    /** 工作单元进度（B-05：数量/状态，不含案件原文） */
+    | 'work_unit_update'
+    /** 交付物原子提交完成（B-05：文件名、状态、行数） */
+    | 'artifact_commit'
+    /** 预算变化（B-05：阶段与已用/上限，不含内容） */
+    | 'budget_update'
+    /** 任务从检查点恢复（B-05：续接的轮次/调用/Token 计数） */
+    | 'run_recovered'
   payload: Record<string, unknown>
   createdAt: string
 }
@@ -1879,6 +1967,61 @@ export interface ChatHistoryTurn {
   text: string
 }
 
+/**
+ * 声明式交付契约（P0-04）：任务创建时声明交付物，Core 启动即在 submission/
+ * 生成可解析骨架，运行中按主键增量回写，避免长任务预算耗尽时零产出。
+ */
+export interface AgentDeliverableEntity {
+  /** 稳定标识（缺省等于 label） */
+  id: string
+  /** 展示名称（如被告姓名、协议名） */
+  label: string
+  /** 该实体必须覆盖的字段（缺省用交付物列/问题全集） */
+  fields: string[]
+}
+
+export interface AgentDeliverableQuestion {
+  id: string
+  text: string
+}
+
+/** 派生交付物：只能由已提交的主交付物数据聚合生成 */
+export interface AgentDeliverableDerived {
+  name: string
+  /** 依赖的主交付文件名 */
+  dependsOn: string[]
+  description?: string
+}
+
+export interface AgentDeliverableSpec {
+  /** 交付文件名（submission/ 下一层，如 deal_points.csv） */
+  name: string
+  /** 格式；缺省按扩展名推断 */
+  format?: 'csv' | 'json' | 'md'
+  /** CSV 列（顺序即表头顺序） */
+  columns?: string[]
+  /** CSV 主键列（按此 upsert，缺省按整行追加） */
+  key?: string[]
+  /** JSON 初始骨架 */
+  skeleton?: Record<string, unknown> | unknown[]
+  /** JSON 数组所在路径（如 ['answers']） */
+  path?: string[]
+  /** JSON 数组元素主键字段（按此 upsert） */
+  itemKey?: string
+  /** 多选列：每个选项都要逐项回查原文后以 ` | ` 连接 */
+  multiPoints?: string[]
+  /** 必须全覆盖的实体全集（如 13 名被告），用于编译工作全集 */
+  expectedEntities?: AgentDeliverableEntity[]
+  /** 必须全覆盖的问题全集（如 15 个问题），与实体交叉形成答案格 */
+  questions?: AgentDeliverableQuestion[]
+  /** 列级合法值域（列名 → 允许值），用于交付校验 */
+  validValues?: Record<string, string[]>
+  /** 派生交付物（按主表聚合生成） */
+  derivedArtifacts?: AgentDeliverableDerived[]
+  title?: string
+  description?: string
+}
+
 export interface StartAgentRequest {
   caseId: string
   mode: AgentMode
@@ -1894,6 +2037,8 @@ export interface StartAgentRequest {
   history?: ChatHistoryTurn[]
   /** 输入坞随问附件（临时性补充材料，不导入案件文档） */
   attachments?: ChatAttachment[]
+  /** 声明式交付契约（P0-04）：缺省由 Core 从请求中推导 */
+  deliverables?: AgentDeliverableSpec[]
 }
 
 export type ApprovalDecision = 'allow_once' | 'allow_task' | 'allow_case' | 'deny'
@@ -2077,6 +2222,503 @@ export interface OcrCorrection {
   originalConfidence?: number | null
   note?: string | null
   createdAt: string
+}
+
+/** 工具调用 Journal 状态（WP01：执行前落 staged，崩溃后可对账） */
+export type ToolJournalStatus =
+  | 'staged'
+  | 'executing'
+  | 'succeeded'
+  | 'failed_retryable'
+  | 'failed_final'
+  | 'unknown'
+  | 'cancelled'
+
+/** 工具副作用类别（决定审批、并发与恢复时是否允许重放） */
+export type ToolEffect = 'read' | 'write' | 'deliverable' | 'memory' | 'external' | 'shell'
+
+/** 工具调用 Journal 条目（只含技术字段，不含参数与结果正文） */
+export interface ToolJournalEntry {
+  id: string
+  taskId: string
+  callId: string
+  toolName: string
+  toolVersion: string
+  origin: 'main' | 'subagent' | string
+  effect: ToolEffect
+  idempotent: boolean
+  status: ToolJournalStatus
+  attempt: number
+  ownerId: string | null
+  fencingToken: number
+  resultRef: string | null
+  resultSha256: string | null
+  errorCode: string | null
+  startedAt: string | null
+  finishedAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+/** 待处置的 unknown 调用（副作用可能已发生，禁止自动重放） */
+export interface UnresolvedToolCall {
+  id: string
+  callId: string
+  toolName: string
+  effect: ToolEffect
+  attempt: number
+  errorCode: string | null
+  updatedAt: string
+}
+
+/** 任务运行时状态（Journal 计数、待处置调用、租约 fencing token） */
+export interface AgentRuntimeStatus {
+  taskId: string
+  /** 空字符串表示任务尚未登记运行时状态 */
+  runtimeVersion: 'v1' | 'v2' | 'v3' | 'legacy' | ''
+  journal: Partial<Record<ToolJournalStatus, number>>
+  unknown: UnresolvedToolCall[]
+  /** 当前租约 fencing token；0 表示无租约（非 V3 任务或已释放） */
+  fencingToken: number
+}
+
+/** 子代理运行状态（§7.5：与 Tool Journal 一致地收紧，终态不可回退） */
+export type SubagentRunStatus =
+  | 'pending'
+  | 'running'
+  | 'staged'
+  | 'accepted'
+  | 'rejected'
+  | 'failed'
+  | 'cancelled'
+
+/** 子代理运行条目（只含技术字段与调查范围，不含结果正文） */
+export interface SubagentRun {
+  id: string
+  taskId: string
+  parentId: string | null
+  kind: 'explore' | 'work_unit' | 'batch'
+  status: SubagentRunStatus
+  /** 调查范围（question / roundsLimit / callId）：属案件内容，只在本地返回 */
+  scope: Record<string, unknown>
+  resultRef: string | null
+  roundsUsed: number
+  toolCallsUsed: number
+  cancelReason: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+/** 恢复中心条目（§7.1：失败/中断/待继续任务的运行时状态） */
+export interface RecoveryCenterItem {
+  taskId: string
+  caseId: string
+  mode: string
+  lifecycle: string
+  stage: string | null
+  runtimeVersion: 'v1' | 'v2' | 'v3' | 'legacy' | ''
+  createdAt: string
+  finishedAt: string | null
+  journal: Partial<Record<ToolJournalStatus, number>>
+  unknownCount: number
+  subagents: Record<string, number>
+  /** 存在 unknown、失败重试、staged/executing 残留时为 true */
+  needsAttention: boolean
+}
+
+/** 恢复中心结果 */
+export interface RecoveryCenterPayload {
+  caseId: string | null
+  items: RecoveryCenterItem[]
+  attentionCount: number
+}
+
+/** unknown 调用的人工处置动作 */
+export type ResolveToolCallAction = 'mark_happened' | 're_execute' | 'ignore'
+
+/** 运行时 Span（WP03：只记录耗时/状态/错误码/计数，禁止写入原文与参数） */
+export interface RuntimeSpan {
+  spanId: string
+  traceId: string
+  parentSpanId: string | null
+  taskId: string | null
+  conversationId: string | null
+  callId: string | null
+  subagentId: string | null
+  runtimeVersion: string | null
+  kind:
+    | 'task'
+    | 'round'
+    | 'model'
+    | 'tool'
+    | 'subagent'
+    | 'compaction'
+    | 'retrieval'
+    | 'delivery'
+    | 'other'
+  name: string
+  status: 'running' | 'ok' | 'error' | 'cancelled' | 'dropped'
+  errorCode: string | null
+  retryCount: number
+  promptTokens: number
+  completionTokens: number
+  budgetCost: Record<string, unknown>
+  startedAt: string
+  endedAt: string | null
+  durationMs: number | null
+  attributes: Record<string, unknown>
+}
+
+/** 任务 Span 聚落摘要（含被丢弃的性能 Span 计数） */
+export interface AgentTraceSummary {
+  taskId: string
+  spanCount: number
+  byKind: Record<string, { count: number; errors: number; durationMs: number }>
+  droppedSpans: number
+  traces: string[]
+}
+
+/** 任务 Span 查询结果 */
+export interface AgentTracePayload {
+  summary: AgentTraceSummary
+  spans: RuntimeSpan[]
+}
+
+/** 本地诊断快照（迁移版本、Span 计数与错误码分布；不含原文与密钥） */
+export interface DiagnosticsSnapshot {
+  generatedAt: string
+  latestMigration: number
+  droppedSpans: number
+  externalTelemetry: false
+  spanCount: number | null
+  errorCodes?: Record<string, number>
+}
+
+/** 统一模型错误类别（WP02：UI 按类别给指引，不展示响应正文） */
+export type ModelErrorCategory =
+  | 'auth'
+  | 'billing'
+  | 'permission'
+  | 'rate_limit'
+  | 'context_overflow'
+  | 'invalid_request'
+  | 'format'
+  | 'timeout'
+  | 'disconnect'
+  | 'stale_stream'
+  | 'provider_unavailable'
+  | 'persistence'
+  | 'cancelled'
+  | 'unknown'
+
+/** 服务商能力描述（不含密钥；`keyConfiguredKey` 是设置项键名） */
+export interface ProviderCapability {
+  providerId: string
+  label: string
+  protocol: string
+  streaming: boolean
+  vision: boolean
+  jsonMode: boolean
+  sendReasoningEffort: boolean
+  maxTokens: number
+  reasoningLevels: string[]
+  reasoningDefault: string
+  keyConfiguredKey: string
+}
+
+/** 服务商健康条目：能力 + 是否已配置密钥（不返回密钥值） */
+export interface ProviderHealth extends ProviderCapability {
+  configured: boolean
+  keyIsSensitive: boolean
+}
+
+/** 模型健康摘要（WP02：配置状态与最近错误类别，不显示密钥） */
+export interface ModelHealth {
+  providers: ProviderHealth[]
+  activeProviderId: string | null
+  recentErrorCodes: Record<string, number>
+  externalTelemetry: false
+}
+
+/** 服务商接入一致性检查结果（新服务商接入验收） */
+export interface ProviderConformance {
+  checked: number
+  issues: string[]
+  ok: boolean
+}
+
+/** 会话检索命中（WP05：真实消息 + 定位锚点，不是 AI 总结） */
+export interface ConversationSearchHit {
+  conversationId: string
+  messageId: string
+  role: 'user' | 'assistant' | string
+  /** 以命中位置为中心的原文摘录（含前后省略号） */
+  snippet: string
+  createdAt: string
+  caseId: string
+  /** 定位锚点：UI 用它滚动到会话内该条消息 */
+  anchor: { kind: 'message'; messageId: string }
+}
+
+/** 会话列表项：带分支来源标注（不返回消息正文） */
+export interface ConversationListItem {
+  id: string
+  caseId: string
+  createdAt: string
+  updatedAt: string
+  messageCount: number
+  parentConversationId: string | null
+  anchorMessageId: string | null
+  isBranch: boolean
+}
+
+/** 会话分支结果（只复制消息，不复制副作用） */
+export interface ConversationBranchResult {
+  conversationId: string
+  caseId: string
+  parentConversationId: string
+  anchorMessageId: string | null
+  messageCount: number
+  createdAt: string
+}
+
+/** 会话彻底删除结果（无软删除；审计只留最小墓碑） */
+export interface ConversationDeleteResult {
+  conversationId: string
+  caseId: string
+  deletedMessages: number
+  deleted: true
+  /** 删除前被取消的活动任务（避免后台任务写回已删会话） */
+  cancelledTaskIds: string[]
+}
+
+/** 产物快照条目（只覆盖工作副本与交付物，不含案件原件） */
+export interface ArtifactSnapshot {
+  snapshotId: string
+  caseId: string
+  taskId: string | null
+  artifactKind: 'deliverable' | 'working_copy' | 'draft' | 'other'
+  name: string
+  sha256: string
+  bytes: number
+  note: string | null
+  createdAt: string
+}
+
+/** 快照回滚结果（写入工作空间内相对路径，原子替换） */
+export interface ArtifactRollbackResult {
+  snapshotId: string
+  caseId: string
+  target: string
+  written: boolean
+  bytes: number | null
+}
+
+/** 案件会话统计（侧栏与诊断用） */
+export interface ConversationStats {
+  caseId: string
+  conversations: number
+  messages: number
+  branches: number
+  indexedMessages: number
+}
+
+/** 共享预算预留资源（WP07） */
+export type BudgetResource =
+  | 'round'
+  | 'tool_call'
+  | 'model_call'
+  | 'prompt_token'
+  | 'completion_token'
+  | 'wall_ms'
+
+/** 共享预算预留汇总（只含计数，不含参数或内容） */
+export interface BudgetReservationSummary {
+  taskId: string
+  /** 键为 "<resource>:<status>"（status: reserved / settled / released） */
+  byResource: Record<string, { count: number; amount: number; spent: number }>
+  /** 在途（未结算/未释放）预留条数 */
+  inflight: number
+}
+
+/** 学习提案状态（未批准不得进入 Prompt / 召回 / 正式记忆） */
+export type LearningProposalStatus = 'pending' | 'approved' | 'rejected' | 'stale' | 'superseded'
+
+/** 学习提案类型 */
+export type LearningProposalKind =
+  | 'case_memory'
+  | 'user_profile'
+  | 'skill_update'
+  | 'dedupe'
+  | 'archive'
+
+/** 学习提案（WP08：批准后才落地；baseHash 冲突须重审） */
+export interface LearningProposal {
+  id: string
+  caseId: string | null
+  taskId: string | null
+  proposalKind: LearningProposalKind
+  targetKey: string
+  baseHash: string
+  status: LearningProposalStatus
+  /** 待应用变更（operation / value / memoryKind 等） */
+  diff: Record<string, unknown>
+  /** 来源（案件事实必须含 documentId / pageNo / quote） */
+  source: Record<string, unknown>
+  rationale: string
+  impact: Record<string, unknown>
+  /** 安全扫描结果（规则与区间，不含原文） */
+  scan: Record<string, unknown>
+  reviewerNote: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+/** 技能安全扫描结果（只含规则与位置区间，不含原文） */
+export interface SkillScanResult {
+  ok: boolean
+  blocked: boolean
+  reasons: string[]
+  findings: Record<string, Array<Record<string, unknown>>>
+  bytes: number
+  rulesHit: string[]
+}
+
+/** 技能暂存条目（列表不含 promptMd） */
+export interface SkillStagingEntry {
+  id: string
+  name: string
+  contentSha256: string
+  description: string
+  allowedTools: string[]
+  sourceOrigin: string
+  baseVersionId: string | null
+  baseHash: string
+  scan: SkillScanResult | Record<string, unknown>
+  status: 'pending' | 'blocked' | 'approved' | 'rejected'
+  blockReason: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+/** 技能暂存详情（含提示词正文） */
+export interface SkillStagingDetail extends SkillStagingEntry {
+  promptMd: string
+}
+
+/** 技能版本（可 diff 与回滚） */
+export interface SkillVersion {
+  versionId: string
+  skillId: string
+  versionNo: number
+  contentSha256: string
+  promptMd: string
+  allowedTools: string[]
+  description: string
+  sourceOrigin: string
+  baseVersionId: string | null
+  scan: Record<string, unknown>
+  active: boolean
+  note: string | null
+  createdAt: string
+}
+
+/** 插件高风险能力（WP10：默认不授予，需逐项确认） */
+export type PluginCapability =
+  | 'fs_write'
+  | 'network'
+  | 'shell'
+  | 'case_read'
+  | 'credential_access'
+
+/** 插件 manifest 摘要（不含命令与凭据） */
+export interface PluginSummary {
+  pluginId: string
+  name: string
+  version: string
+  license: string
+  /** 哈希前缀（完整哈希仅本地校验用） */
+  sha256: string
+  tools: string[]
+  capabilities: Partial<Record<PluginCapability, boolean>>
+  cases: string[]
+  enabled: boolean
+  source: string
+}
+
+/** 插件准入审查结论 */
+export interface PluginReview {
+  pluginId: string
+  ok: boolean
+  issues: string[]
+  warnings: string[]
+  riskyCapabilities: PluginCapability[]
+  licenseAllowed: boolean
+}
+
+/** 执行后端能力声明（docker 未实现时显式不可用） */
+export interface ExecBackendCapability {
+  name: string
+  network: boolean
+  writableFs: boolean
+  pidIsolated: boolean
+  mountRoots: string[]
+  /** Shell 类操作在任何后端都需要审批（容器化不是豁免理由） */
+  requiresApproval: boolean
+}
+
+/** 插件 / MCP / 执行后端总状态（诊断用，不含命令与凭据） */
+export interface PluginSubsystemStatus {
+  plugins: {
+    installed: number
+    enabled: number
+    defaultEnabled: false
+    inProcessImport: false
+    sandbox: 'subprocess-only'
+  }
+  mcp: { enabled: boolean; registered: number; running: number; defaultNetwork: false }
+  execBackend: {
+    available: string[]
+    declared: string[]
+    unimplemented: string[]
+    active: ExecBackendCapability
+  }
+}
+
+/** 受限本地自动化动作（M8：全部只读，不触碰外部系统） */
+export type AutomationAction =
+  | 'reverify_claims'
+  | 'check_stale_documents'
+  | 'report_pending_human'
+
+/** 自动化能力边界（UI 与门禁共用同一口径） */
+export interface AutomationCapability {
+  enabled: boolean
+  settingKey: string
+  allowedActions: AutomationAction[]
+  /** 明确禁止的动作：用于门禁断言与界面说明 */
+  forbiddenActions: string[]
+  sendsExternalContent: false
+  schedulesBackgroundJobs: false
+  requiresUserActionForWrites: true
+  /** 唯一写入是审计事件，不写案件内容 */
+  writesOnlyAudit: true
+}
+
+/** 单次本地检查结果（只含计数与 reason code，不含原文） */
+export interface AutomationRunResult {
+  caseId: string
+  ranAt: string
+  actions: Array<Record<string, unknown>>
+  staleClaims: number
+  /** 引语仍可在原文定位、用户点"重新核验"即可恢复的候选数 */
+  recoverableClaims: number
+  staleMemories: number
+  /** 源文档已失效但仍被当作有效事实的记忆数 */
+  memoriesAtRisk: number
+  staleProposals: number
+  needsHuman: number
+  note: string
 }
 
 /** 页文本更正结果（Q-009：引语不再可定位的 Claim 转待校验，不静默错位） */
@@ -2428,6 +3070,8 @@ export interface LawBuddyBridge {
       attachments?: ChatAttachment[]
       /** 会话 id（V26）：同会话续聊时传入；缺省由 Core 新建并随返回值回传 */
       conversationId?: string
+      /** 声明式交付契约（P0-04）：缺省由 Core 从请求中推导出输出文件名 */
+      deliverables?: AgentDeliverableSpec[]
     }): Promise<AgentTaskInfo>
     getTask(taskId: string): Promise<AgentTaskInfo>
     resume(taskId: string): Promise<AgentTaskInfo>
@@ -2443,6 +3087,70 @@ export interface LawBuddyBridge {
     getPendingQuestions(req: { taskId: string }): Promise<HumanQuestionSet | null>
     /** 订阅 Core 推送的任务事件（REQ-AI-001）；返回退订函数；重复事件按 seq 去重 */
     onAgentEvent(cb: (n: AgentEventNotification) => void): () => void
+    /** 运行时状态（WP01：Journal 计数、待处置 unknown、租约 fencing token） */
+    runtimeStatus(taskId: string): Promise<AgentRuntimeStatus>
+    /** 工具调用 Journal 明细（只含技术字段，不含参数与结果正文） */
+    toolJournal(req: { taskId: string; status?: ToolJournalStatus; limit?: number }): Promise<ToolJournalEntry[]>
+    /** 子代理运行明细（§7.5：工作单元、状态与轮次/工具计数） */
+    subagentRuns(req: { taskId: string; limit?: number }): Promise<SubagentRun[]>
+    /** 恢复中心（§7.1：失败/中断/待继续任务 + 待处置 unknown 调用） */
+    recoveryCenter(req?: { caseId?: string }): Promise<RecoveryCenterPayload>
+    /** 人工处置 unknown 调用：副作用不确定时禁止自动重放，必须由用户明确选择 */
+    resolveToolCall(req: {
+      taskId: string
+      journalId: string
+      action: ResolveToolCallAction
+    }): Promise<{ taskId: string; entry: ToolJournalEntry }>
+    /** 任务 Span 调用链与聚合摘要（WP03：仅技术字段） */
+    trace(req: { taskId: string; traceId?: string }): Promise<AgentTracePayload>
+    /** 读取压缩归档（恢复/诊断）：归档含原文，只在本地返回 */
+    compactionArchive(req: {
+      taskId: string
+      archiveId: string
+    }): Promise<{ taskId: string; archiveId: string; messages: Array<Record<string, unknown>> }>
+    /** 共享预算预留汇总（WP07：只含计数） */
+    budgetReservations(req: { taskId: string }): Promise<BudgetReservationSummary>
+    /** 释放某执行者的在途预留（子代理取消/超时传播） */
+    releaseSubagentBudget(req: {
+      taskId: string
+      ownerId: string
+    }): Promise<{ taskId: string; released: number }>
+  }
+  /** 本地诊断（WP03：迁移版本 / Span 计数 / 错误码分布；无外部遥测） */
+  diagnostics: {
+    snapshot(): Promise<DiagnosticsSnapshot>
+    /**
+     * 导出本地诊断包（JSON）：只含技术字段，不含案件原文、查询词、工具参数与密钥；
+     * 返回 null 表示用户取消保存
+     */
+    export(): Promise<{ fileName: string; sizeBytes: number } | null>
+  }
+  /** 会话管理（WP05：搜索 / 分支 / 彻底删除 / 产物快照） */
+  conversation: {
+    /** 会话列表（含分支来源标注；不返回消息正文） */
+    list(req: { caseId: string; limit?: number }): Promise<ConversationListItem[]>
+    /** 案件内检索：返回真实消息与定位锚点；默认不调用 LLM */
+    search(req: {
+      caseId: string
+      query: string
+      conversationId?: string
+      limit?: number
+    }): Promise<ConversationSearchHit[]>
+    /** 从锚点分支：只复制消息，不复制任务/审批/预算/Journal */
+    branch(req: {
+      conversationId: string
+      anchorMessageId?: string
+    }): Promise<ConversationBranchResult>
+    /** 彻底删除（无软删除）：先取消活动任务，再清理消息/索引/分支 */
+    delete(req: { conversationId: string }): Promise<ConversationDeleteResult>
+    snapshots(req: { caseId: string; name?: string; limit?: number }): Promise<ArtifactSnapshot[]>
+    /** 快照回滚到工作空间相对路径（不得写入案件原件目录） */
+    rollback(req: {
+      snapshotId: string
+      caseId: string
+      targetPath: string
+    }): Promise<ArtifactRollbackResult>
+    stats(req: { caseId: string }): Promise<ConversationStats>
   }
   /** 设置（模型 API Key 等；敏感键只回传 configured 状态） */
   settings: {
@@ -2477,6 +3185,10 @@ export interface LawBuddyBridge {
        */
       checkVision?: boolean
     }): Promise<ModelTestResult>
+    /** 服务商健康摘要（WP02：configured 状态 + 最近错误类别；不回传密钥） */
+    health(): Promise<ModelHealth>
+    /** 服务商接入一致性检查（新服务商最小契约；不发网络请求） */
+    conformance(req?: { providerId?: string }): Promise<ProviderConformance>
   }
   /** 审批与权限（DEV-AGT-004） */
   approval: {
@@ -2757,5 +3469,92 @@ export interface LawBuddyBridge {
   skill: {
     list(): Promise<SkillInfo[]>
     remove(req: { skillId: string }): Promise<{ removed: boolean }>
+    /** 暂存列表（WP09：不含提示词正文） */
+    staging(req?: { status?: string; limit?: number }): Promise<SkillStagingEntry[]>
+    /** 写入暂存并扫描；危险项标记 blocked，不可强制放行 */
+    stage(req: {
+      name: string
+      promptMd: string
+      description?: string
+      allowedTools?: string[]
+      sourceOrigin?: string
+    }): Promise<SkillStagingDetail>
+    /** 暂存详情（含正文） */
+    stagingDetail(req: { stagingId: string }): Promise<SkillStagingDetail>
+    /** 批准暂存并生成新版本（blocked 项会被拒绝） */
+    approveStaging(req: { stagingId: string; note?: string }): Promise<{
+      skillId: string
+      versionId: string
+      name: string
+      status: string
+    }>
+    rejectStaging(req: { stagingId: string; note?: string }): Promise<SkillStagingDetail>
+    versions(req: { skillId: string }): Promise<SkillVersion[]>
+    diff(req: { skillId: string; fromVersion: number; toVersion: number }): Promise<{
+      skillId: string
+      fromVersion: number
+      toVersion: number
+      diff: string
+      oldSha256: string
+      newSha256: string
+    }>
+    /** 回滚到指定版本（只恢复提示词） */
+    rollback(req: { skillId: string; versionNo: number; note?: string }): Promise<{
+      skillId: string
+      activeVersion: number
+      rolledBack: boolean
+    }>
+  }
+  /** 学习提案（WP08：批准后才进入 Prompt / 召回 / 正式记忆） */
+  learning: {
+    proposals(req?: {
+      caseId?: string
+      status?: LearningProposalStatus
+      limit?: number
+    }): Promise<LearningProposal[]>
+    approve(req: {
+      proposalId: string
+      note?: string
+      acceptDiff?: Record<string, unknown>
+    }): Promise<LearningProposal & { applied: Record<string, unknown> }>
+    reject(req: { proposalId: string; note?: string }): Promise<LearningProposal>
+    rollback(req: { proposalId: string; note?: string }): Promise<LearningProposal>
+  }
+  /** 受限本地自动化（M8：只读重验与提醒，无外发、无后台定时器） */
+  automation: {
+    /** 能力边界：允许/禁止动作与"不外发、不排后台任务"声明 */
+    status(): Promise<AutomationCapability>
+    /** 手动执行一次本地检查（只读；默认全部动作） */
+    run(req: { caseId: string; actions?: AutomationAction[] }): Promise<AutomationRunResult>
+  }
+  /** 插件 / MCP / 执行后端（WP10：默认全部禁用，子进程隔离） */
+  plugin: {
+    /** 子系统状态（不含命令、环境变量与凭据） */
+    status(): Promise<PluginSubsystemStatus>
+    list(req?: { includeDisabled?: boolean }): Promise<PluginSummary[]>
+    /** 只审查本地 manifest，不安装 */
+    review(req: { manifest: string }): Promise<{
+      manifest: PluginSummary
+      review: PluginReview
+    }>
+    /** 安装（不启用）；审查不通过直接拒绝 */
+    install(req: { manifest: string }): Promise<PluginSummary & { review: PluginReview }>
+    /** 启用：必须逐项授予声明的高风险能力 */
+    enable(req: {
+      pluginId: string
+      grantedCapabilities?: PluginCapability[]
+    }): Promise<PluginSummary & { granted: string[] }>
+    disable(req: { pluginId: string }): Promise<PluginSummary>
+    /** 卸载：清理注册、授权与进程，不自动重启 */
+    uninstall(req: { pluginId: string }): Promise<{
+      pluginId: string
+      uninstalled: boolean
+      toolsRemoved: number
+      restartScheduled: false
+    }>
+    /** 已登记的 MCP 服务（未启用时为空） */
+    mcpServers(): Promise<Array<PluginSummary | Record<string, unknown>>>
+    /** 卸载全部 MCP 进程 */
+    mcpShutdown(): Promise<{ cleaned: number }>
   }
 }

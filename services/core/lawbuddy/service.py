@@ -29,6 +29,44 @@ def _probe(module: str) -> bool:
         return False
 
 
+def _tasks_for_conversation(conversation_id: str) -> list[dict[str, Any]]:
+    """该会话下仍可能推进的任务（删除会话前需要先取消，避免消息写回已删会话）。"""
+    from .agent import tasks as task_store
+    from .storage import get_db
+
+    terminal = ("COMPLETED", "COMPLETED_WITH_WARNINGS", "CANCELLED", "FAILED")
+    rows = get_db().query(
+        "SELECT id FROM tasks WHERE conversation_id = ? AND lifecycle NOT IN (?, ?, ?, ?)",
+        (conversation_id, *terminal),
+    )
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            out.append(task_store.get_task(str(row["id"])))
+        except Exception:  # noqa: BLE001 任务已不可读时跳过
+            continue
+    return out
+
+
+def _collapse_disabled_subsystems(key: str, value: Any) -> None:
+    """关闭能力开关时收敛运行态（DoD：关闭后不留后台任务/子进程）。
+
+    只处理**显式关闭**：`agent.plugins` / `agent.mcpEnabled` 任一关闭都停止
+    MCP 子进程；插件注册不删除，便于重新开启后按原授权恢复。
+    """
+    if key not in ("agent.plugins", "agent.mcpEnabled"):
+        return
+    on = value is True or (isinstance(value, str) and value.strip().lower() in ("1", "true", "on", "yes"))
+    if on:
+        return
+    try:
+        from .agent import mcp_runtime
+
+        mcp_runtime.shutdown()
+    except Exception:  # noqa: BLE001 收敛失败不应阻断设置写入
+        pass
+
+
 def register(server: RpcServer) -> None:
     @server.method("core.handshake")
     def handshake(_params: dict[str, Any]) -> dict[str, Any]:
@@ -541,6 +579,9 @@ def register(server: RpcServer) -> None:
             # 跨任务对话历史（无会话时的兜底；有 conversation 时 runner 用 Core 全文历史覆盖）
             history=list(params.get("history") or []),
             conversation_id=conversation_id,
+            # 声明式交付契约（P0-04）：显式声明优先，缺省由 Core 从请求推导
+            # 传原始值：规范化（丢弃无效项、去重、推断格式）统一由 tasks 层完成
+            deliverables=params.get("deliverables") or [],
         )
         return AgentRunner.instance().start(task["id"], attachments=attachments or None)
 
@@ -652,6 +693,7 @@ def register(server: RpcServer) -> None:
             set_provider(str(value or ""))
         else:
             set_setting(key, value)
+            _collapse_disabled_subsystems(key, value)
         return {"ok": True}
 
     # ---- 模型服务商（内置官方预设 + 自定义 API） -------------------------------
@@ -796,6 +838,594 @@ def register(server: RpcServer) -> None:
         from .agent import budget
 
         return budget.snapshot(str(params["taskId"]))
+
+    @server.method("agent.budget_reservations")
+    def agent_budget_reservations(params: dict[str, Any]) -> dict[str, Any]:
+        """共享预算预留汇总（WP07）：按资源/状态聚合，只含计数，不含参数或内容。"""
+        from .agent import budget
+
+        task_id = str(params.get("taskId") or "").strip()
+        if not task_id:
+            raise ValueError("缺少任务 ID")
+        return budget.reservations(task_id)
+
+    @server.method("agent.release_subagent_budget")
+    def agent_release_subagent_budget(params: dict[str, Any]) -> dict[str, Any]:
+        """释放某执行者的在途预留（子代理取消/超时传播时调用）。"""
+        from .agent import budget
+
+        task_id = str(params.get("taskId") or "").strip()
+        owner_id = str(params.get("ownerId") or "").strip()
+        if not task_id or not owner_id:
+            raise ValueError("缺少任务 ID 或执行者 ID")
+        return {"taskId": task_id, "released": budget.release_owner(task_id, owner_id)}
+
+    # ---- 学习提案与技能生命周期（WP08/WP09） ------------------------------------
+
+    @server.method("learning.proposals")
+    def learning_proposals(params: dict[str, Any]) -> list[dict[str, Any]]:
+        """学习提案列表（未批准的提案不得进入 Prompt/召回）。"""
+        from .agent import learning
+
+        return learning.list_proposals(
+            case_id=(str(params["caseId"]) if params.get("caseId") else None),
+            status=(str(params["status"]) if params.get("status") else None),
+            limit=int(params.get("limit") or 50),
+        )
+
+    @server.method("learning.approve")
+    def learning_approve(params: dict[str, Any]) -> dict[str, Any]:
+        """批准提案并落地；基线冲突会拒绝并要求重审（不覆盖新值）。"""
+        from .agent import learning
+
+        return learning.approve(
+            str(params.get("proposalId") or ""),
+            note=(str(params["note"]) if params.get("note") else None),
+            accept_diff=(params.get("acceptDiff") if isinstance(params.get("acceptDiff"), dict) else None),
+        )
+
+    @server.method("learning.reject")
+    def learning_reject(params: dict[str, Any]) -> dict[str, Any]:
+        from .agent import learning
+
+        return learning.reject(
+            str(params.get("proposalId") or ""),
+            note=(str(params["note"]) if params.get("note") else None),
+        )
+
+    @server.method("learning.rollback")
+    def learning_rollback(params: dict[str, Any]) -> dict[str, Any]:
+        """回滚已批准的案件记忆提案（只影响该键，不删审计）。"""
+        from .agent import learning
+
+        return learning.rollback(
+            str(params.get("proposalId") or ""),
+            note=(str(params["note"]) if params.get("note") else None),
+        )
+
+    @server.method("skill.staging")
+    def skill_staging(params: dict[str, Any]) -> list[dict[str, Any]]:
+        """技能暂存列表（不返回正文；正文按 ID 单独读取）。"""
+        from . import skill_lifecycle
+
+        return skill_lifecycle.list_staging(
+            status=(str(params["status"]) if params.get("status") else None),
+            limit=int(params.get("limit") or 50),
+        )
+
+    @server.method("skill.stage")
+    def skill_stage(params: dict[str, Any]) -> dict[str, Any]:
+        """写入技能暂存区并扫描；危险项标记 blocked 且不可强制放行。"""
+        from . import skill_lifecycle
+
+        return skill_lifecycle.stage(
+            name=str(params.get("name") or ""),
+            prompt_md=str(params.get("promptMd") or ""),
+            description=str(params.get("description") or ""),
+            allowed_tools=[str(t) for t in (params.get("allowedTools") or [])],
+            source_origin=str(params.get("sourceOrigin") or "local://paste"),
+        )
+
+    @server.method("skill.staging_detail")
+    def skill_staging_detail(params: dict[str, Any]) -> dict[str, Any]:
+        from . import skill_lifecycle
+
+        return skill_lifecycle.get_staging(str(params.get("stagingId") or ""))
+
+    @server.method("skill.approve_staging")
+    def skill_approve_staging(params: dict[str, Any]) -> dict[str, Any]:
+        """批准暂存并生成技能新版本（blocked 项拒绝批准）。"""
+        from . import skill_lifecycle
+
+        return skill_lifecycle.approve(
+            str(params.get("stagingId") or ""),
+            note=(str(params["note"]) if params.get("note") else None),
+        )
+
+    @server.method("skill.reject_staging")
+    def skill_reject_staging(params: dict[str, Any]) -> dict[str, Any]:
+        from . import skill_lifecycle
+
+        return skill_lifecycle.reject(
+            str(params.get("stagingId") or ""),
+            note=(str(params["note"]) if params.get("note") else None),
+        )
+
+    @server.method("skill.versions")
+    def skill_versions(params: dict[str, Any]) -> list[dict[str, Any]]:
+        from . import skill_lifecycle
+
+        return skill_lifecycle.list_versions(str(params.get("skillId") or ""))
+
+    @server.method("skill.diff")
+    def skill_diff(params: dict[str, Any]) -> dict[str, Any]:
+        from . import skill_lifecycle
+
+        return skill_lifecycle.diff(
+            str(params.get("skillId") or ""),
+            int(params.get("fromVersion") or 1),
+            int(params.get("toVersion") or 1),
+        )
+
+    @server.method("skill.rollback")
+    def skill_rollback(params: dict[str, Any]) -> dict[str, Any]:
+        """回滚到指定技能版本（只恢复提示词，不影响案件、记忆与授权）。"""
+        from . import skill_lifecycle
+
+        return skill_lifecycle.rollback(
+            str(params.get("skillId") or ""),
+            int(params.get("versionNo") or 1),
+            note=(str(params["note"]) if params.get("note") else None),
+        )
+
+    # ---- 受限本地自动化（M8：只读重验与提醒，无外发、无后台定时器） ---------------
+
+    @server.method("automation.status")
+    def automation_status(_params: dict[str, Any]) -> dict[str, Any]:
+        """自动化能力边界与开关状态（UI 与门禁共用同一口径）。"""
+        from . import local_automation
+
+        return local_automation.capability_report()
+
+    @server.method("automation.run")
+    def automation_run(params: dict[str, Any]) -> dict[str, Any]:
+        """手动执行一次本地检查（只读）。
+
+        不注册后台定时器、不新建任务、不调用模型、不外发任何内容；
+        唯一写入是审计事件 `automation.local_run`（只含计数与 reason code）。
+        """
+        from . import local_automation
+
+        case_id = str(params.get("caseId") or "").strip()
+        if not case_id:
+            raise ValueError("缺少案件 ID")
+        actions = params.get("actions")
+        return local_automation.run(
+            case_id, [str(a) for a in actions] if actions else None
+        )
+
+    # ---- 插件 / MCP / 执行后端（WP10；默认全部禁用） ----------------------------
+
+    @server.method("plugin.status")
+    def plugin_status(_params: dict[str, Any]) -> dict[str, Any]:
+        """插件与 MCP 子系统状态（不含命令、环境变量与凭据）。"""
+        from .agent import exec_backend, mcp_runtime, plugin_host
+
+        return {
+            "plugins": plugin_host.status(),
+            "mcp": mcp_runtime.status(),
+            "execBackend": exec_backend.capabilities(),
+        }
+
+    @server.method("plugin.list")
+    def plugin_list(params: dict[str, Any]) -> list[dict[str, Any]]:
+        """已登记插件（默认不含 manifest 命令细节）。"""
+        from .agent import plugin_host
+
+        return plugin_host.list_plugins(
+            include_disabled=bool(params.get("includeDisabled", True))
+        )
+
+    @server.method("plugin.review")
+    def plugin_review(params: dict[str, Any]) -> dict[str, Any]:
+        """审查本地 manifest（许可证 / 哈希 / 能力），**只审查不安装**。"""
+        from .agent import plugin_host
+
+        manifest = plugin_host.manifest_from_json(str(params.get("manifest") or ""))
+        return {"manifest": manifest.public(), "review": plugin_host.review(manifest)}
+
+    @server.method("plugin.install")
+    def plugin_install(params: dict[str, Any]) -> dict[str, Any]:
+        """安装插件（不启用）：审查不通过直接拒绝。"""
+        from .agent import plugin_host
+
+        manifest = plugin_host.manifest_from_json(str(params.get("manifest") or ""))
+        return plugin_host.install(manifest)
+
+    @server.method("plugin.enable")
+    def plugin_enable(params: dict[str, Any]) -> dict[str, Any]:
+        """启用插件：逐项授予其声明的高风险能力，未授予则拒绝。"""
+        from .agent import plugin_host
+
+        return plugin_host.enable(
+            str(params.get("pluginId") or ""),
+            granted_capabilities=[str(c) for c in (params.get("grantedCapabilities") or [])],
+        )
+
+    @server.method("plugin.disable")
+    def plugin_disable(params: dict[str, Any]) -> dict[str, Any]:
+        from .agent import plugin_host
+
+        return plugin_host.disable(str(params.get("pluginId") or ""))
+
+    @server.method("plugin.uninstall")
+    def plugin_uninstall(params: dict[str, Any]) -> dict[str, Any]:
+        """卸载插件：清理注册、授权与进程，不自动重启。"""
+        from .agent import plugin_host
+
+        return plugin_host.uninstall(str(params.get("pluginId") or ""))
+
+    @server.method("mcp.servers")
+    def mcp_servers(_params: dict[str, Any]) -> list[dict[str, Any]]:
+        """已登记的 MCP 服务（未启用时返回空列表）。"""
+        from .agent import mcp_runtime
+
+        return mcp_runtime.list_servers()
+
+    @server.method("mcp.shutdown")
+    def mcp_shutdown(_params: dict[str, Any]) -> dict[str, Any]:
+        """卸载全部 MCP 进程（退出或排障时使用）。"""
+        from .agent import mcp_runtime
+
+        return {"cleaned": mcp_runtime.shutdown()}
+
+    # ---- 会话管理（WP05：搜索 / 分支 / 彻底删除 / 产物快照） ---------------------
+
+    @server.method("conversation.list")
+    def conversation_list(params: dict[str, Any]) -> list[dict[str, Any]]:
+        """案件会话列表（含分支来源标注，不返回消息正文）。"""
+        from . import conversation_search
+
+        return conversation_search.list_with_branches(
+            str(params.get("caseId") or ""), limit=int(params.get("limit") or 50)
+        )
+
+    @server.method("conversation.search")
+    def conversation_search_rpc(params: dict[str, Any]) -> list[dict[str, Any]]:
+        """案件内会话检索：返回真实消息 + 定位锚点；默认不调用 LLM。
+
+        案件 ID 必填且在 SQL 层强制过滤，跨案命中一律丢弃（WP05 硬约束）。
+        """
+        from . import conversation_search
+
+        return conversation_search.search(
+            str(params.get("caseId") or ""),
+            str(params.get("query") or ""),
+            limit=int(params.get("limit") or 30),
+            conversation_id=(str(params["conversationId"]) if params.get("conversationId") else None),
+        )
+
+    @server.method("conversation.branch")
+    def conversation_branch(params: dict[str, Any]) -> dict[str, Any]:
+        """从锚点分支出新会话：只复制消息文本，不复制任务/审批/预算/Journal。"""
+        from . import conversation_search
+
+        return conversation_search.branch(
+            str(params.get("conversationId") or ""),
+            anchor_message_id=(str(params["anchorMessageId"]) if params.get("anchorMessageId") else None),
+        )
+
+    @server.method("conversation.delete")
+    def conversation_delete(params: dict[str, Any]) -> dict[str, Any]:
+        """彻底删除会话（消息 / 检索索引 / 分支记录），无软删除。
+
+        删除前先取消该会话下仍在跑的任务，避免后台任务把消息写回已删会话；
+        审计只记录会话 ID 与删除计数，不含任何消息内容。
+        """
+        from . import audit, conversation_search
+        from .agent import runner, tasks as task_store
+
+        conversation_id = str(params.get("conversationId") or "").strip()
+        if not conversation_id:
+            raise ValueError("缺少会话 ID")
+        cancelled: list[str] = []
+        for task in _tasks_for_conversation(conversation_id):
+            try:
+                runner.cancel(task["id"])
+                task_store.update_lifecycle(task["id"], "CANCELLED")
+                cancelled.append(task["id"])
+            except Exception:  # noqa: BLE001 取消失败不阻断删除，但记录在结果里
+                pass
+        result = conversation_search.delete(conversation_id)
+        from .storage import get_db
+
+        with get_db().transaction() as conn:
+            audit.append(
+                conn,
+                action="conversation.delete",
+                resource_type="conversation",
+                resource_id=conversation_id,
+                case_id=result["caseId"],
+                metadata={
+                    "deletedMessages": result["deletedMessages"],
+                    "cancelledTasks": len(cancelled),
+                },
+            )
+        return {**result, "cancelledTaskIds": cancelled}
+
+    @server.method("conversation.snapshots")
+    def conversation_snapshots(params: dict[str, Any]) -> list[dict[str, Any]]:
+        """案件产物快照列表（工作副本与交付物；不含原件）。"""
+        from . import conversation_search
+
+        return conversation_search.list_snapshots(
+            str(params.get("caseId") or ""),
+            name=(str(params["name"]) if params.get("name") else None),
+            limit=int(params.get("limit") or 50),
+        )
+
+    @server.method("conversation.rollback")
+    def conversation_rollback(params: dict[str, Any]) -> dict[str, Any]:
+        """把快照写回工作空间目标路径（原子替换，绝不覆盖案件原件）。"""
+        from . import conversation_search
+
+        result = conversation_search.rollback(
+            str(params.get("snapshotId") or ""),
+            str(params.get("caseId") or ""),
+            str(params.get("targetPath") or ""),
+        )
+        from . import audit
+        from .storage import get_db
+
+        with get_db().transaction() as conn:
+            audit.append(
+                conn,
+                action="conversation.rollback",
+                resource_type="artifact_snapshot",
+                resource_id=result["snapshotId"],
+                case_id=result["caseId"],
+                metadata={"target": result["target"]},
+            )
+        return result
+
+    @server.method("conversation.stats")
+    def conversation_stats(params: dict[str, Any]) -> dict[str, Any]:
+        """案件会话统计（会话数 / 消息数 / 分支数 / 索引条数）。"""
+        from . import conversation_search
+
+        return conversation_search.stats(str(params.get("caseId") or ""))
+
+    # ---- 运行时底座（WP01/WP03：Journal、恢复处置、Span 与诊断） -----------------
+
+    @server.method("agent.runtime_status")
+    def agent_runtime_status(params: dict[str, Any]) -> dict[str, Any]:
+        """任务运行时状态：版本、Journal 计数、待处置 unknown 与租约 fencing token。
+
+        只返回状态与计数，不含工具参数、结果正文或案件原文（WP03）。
+        """
+        from .agent import tool_journal
+        from .agent.tasks import get_task
+        from .storage import get_db
+
+        task_id = str(params.get("taskId") or "").strip()
+        if not task_id:
+            raise ValueError("缺少任务 ID")
+        get_task(task_id)  # 不存在时抛错，避免返回伪造的空状态
+        row = get_db().query_one(
+            "SELECT runtime_version FROM agent_runtime_state WHERE task_id = ?", (task_id,)
+        )
+        return {
+            "taskId": task_id,
+            "runtimeVersion": str((row or {}).get("runtime_version") or ""),
+            "journal": tool_journal.stats(task_id),
+            "unknown": [
+                {k: e[k] for k in (
+                    "id", "callId", "toolName", "effect", "attempt", "errorCode", "updatedAt",
+                )}
+                for e in tool_journal.unresolved_unknown(task_id)
+            ],
+            "fencingToken": tool_journal.current_fence(task_id),
+        }
+
+    @server.method("agent.tool_journal")
+    def agent_tool_journal(params: dict[str, Any]) -> list[dict[str, Any]]:
+        """列出任务工具调用 Journal 条目（默认最近 200 条，可按状态过滤）。"""
+        from .agent import tool_journal
+
+        return tool_journal.list_for_task(
+            str(params.get("taskId") or ""),
+            status=(str(params["status"]) if params.get("status") else None),
+            limit=int(params.get("limit") or 200),
+        )
+
+    @server.method("agent.subagent_runs")
+    def agent_subagent_runs(params: dict[str, Any]) -> list[dict[str, Any]]:
+        """任务下的子代理运行（§7.5：工作单元、状态与预算计数）。
+
+        `scope` 里的调查问题属于案件内容，只在本地加密库返回，不写日志。
+        """
+        from .agent import subagent_runs
+
+        task_id = str(params.get("taskId") or "").strip()
+        if not task_id:
+            raise ValueError("缺少任务 ID")
+        return subagent_runs.list_for_task(task_id, limit=int(params.get("limit") or 100))
+
+    @server.method("agent.recovery_center")
+    def agent_recovery_center(params: dict[str, Any]) -> dict[str, Any]:
+        """恢复中心数据源（§7.1）：失败/中断/待继续任务 + 待处置 unknown 调用。
+
+        只按案件范围返回技术状态与计数；不返回工具参数、结果正文或案件原文。
+        """
+        from .agent import subagent_runs, tasks as task_store, tool_journal
+        from .storage import get_db
+
+        case_id = str(params.get("caseId") or "").strip()
+        if case_id:
+            # 恢复中心也要覆盖已归档案件的遗留失败任务，因此只校验存在性
+            from .cases import get_case
+
+            get_case(case_id)
+            rows = get_db().query(
+                "SELECT id FROM tasks WHERE case_id = ? ORDER BY updated_at DESC LIMIT 60",
+                (case_id,),
+            )
+        else:
+            rows = get_db().query("SELECT id FROM tasks ORDER BY updated_at DESC LIMIT 60")
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            task_id = str(row["id"])
+            try:
+                task = task_store.get_task(task_id)
+            except Exception:  # noqa: BLE001 任务不可读时跳过，不伪造状态
+                continue
+            journal = tool_journal.stats(task_id)
+            unknown = tool_journal.unresolved_unknown(task_id)
+            subs = subagent_runs.stats(task_id)
+            needs_attention = bool(
+                unknown
+                or journal.get("failed_retryable")
+                or journal.get("failed_final")
+                or journal.get("staged")
+                or journal.get("executing")
+            )
+            items.append({
+                "taskId": task_id,
+                "caseId": task["caseId"],
+                "mode": task["mode"],
+                "lifecycle": task["lifecycle"],
+                "stage": task["stage"],
+                "runtimeVersion": task["runtimeVersion"] or "",
+                "createdAt": task["createdAt"],
+                "finishedAt": task["finishedAt"],
+                "journal": journal,
+                "unknownCount": len(unknown),
+                "subagents": subs,
+                "needsAttention": needs_attention,
+            })
+        return {
+            "caseId": case_id or None,
+            "items": items,
+            "attentionCount": sum(1 for i in items if i["needsAttention"]),
+        }
+
+    @server.method("agent.resolve_tool_call")
+    def agent_resolve_tool_call(params: dict[str, Any]) -> dict[str, Any]:
+        """人工处置 unknown 工具调用（mark_happened / re_execute / ignore）。
+
+        非幂等调用在副作用不确定时禁止自动重放，必须由用户明确选择。
+        """
+        from .agent import tool_journal
+
+        task_id = str(params.get("taskId") or "").strip()
+        journal_id = str(params.get("journalId") or "").strip()
+        action = str(params.get("action") or "").strip()
+        if not task_id or not journal_id:
+            raise ValueError("缺少任务 ID 或调用 ID")
+        entry = tool_journal.get_by_id(journal_id)
+        if entry is None or entry["taskId"] != task_id:
+            raise ValueError("工具调用登记不存在")
+        fence = tool_journal.current_fence(task_id)
+        updated = tool_journal.resolve(
+            journal_id, action, owner_id="user-resolution", fencing_token=fence,
+        )
+        return {"taskId": task_id, "entry": updated}
+
+    @server.method("agent.trace")
+    def agent_trace(params: dict[str, Any]) -> dict[str, Any]:
+        """任务 Span 调用链与聚合摘要（仅技术字段，含丢弃计数）。"""
+        from .agent import observability
+
+        task_id = str(params.get("taskId") or "").strip()
+        if not task_id:
+            raise ValueError("缺少任务 ID")
+        return {
+            "summary": observability.trace_summary(task_id),
+            "spans": observability.trace(
+                task_id, trace_id=(str(params["traceId"]) if params.get("traceId") else None),
+            ),
+        }
+
+    @server.method("diagnostics.snapshot")
+    def diagnostics_snapshot(_params: dict[str, Any]) -> dict[str, Any]:
+        """本地诊断快照：迁移版本、Span 计数与错误码分布；不含原文与密钥。"""
+        from .agent import observability
+
+        return observability.diagnostics()
+
+    @server.method("diagnostics.export")
+    def diagnostics_export(_params: dict[str, Any]) -> dict[str, Any]:
+        """打包本地诊断（§7.7）：只含技术字段，敏感内容不可勾选导出。
+
+        与 `observability.diagnostics_bundle()` 同源，避免 UI、RPC 与评测三处口径漂移。
+        内容固定为：迁移版本、Span 计数与错误类别、插件/MCP 子系统状态，
+        并显式声明排除案件原文、查询词、工具参数与密钥。
+        """
+        from .agent import observability
+
+        return observability.diagnostics_bundle()
+
+    @server.method("model.health")
+    def model_health(_params: dict[str, Any]) -> dict[str, Any]:
+        """模型服务商健康摘要：已配置状态、能力与最近错误类别。
+
+        只返回 `configured` 等元数据与非敏感能力描述，**绝不回传密钥值**；
+        最近错误按 Span 中的错误类别聚合（不含响应正文）。
+        """
+        from .agent import observability, provider_profile
+        from .agent import tasks as task_store
+        from .agent.tasks import is_sensitive_setting
+
+        providers: list[dict[str, Any]] = []
+        for prof in provider_profile.all_profiles():
+            key_name = prof.configured_key_hint
+            try:
+                configured = bool(task_store.get_setting(key_name))
+            except Exception:  # noqa: BLE001 读取失败按未配置处理（不得误报可用）
+                configured = False
+            providers.append({**prof.public(), "configured": configured,
+                              "keyIsSensitive": is_sensitive_setting(key_name)})
+        try:
+            error_codes = observability.diagnostics().get("errorCodes") or {}
+        except Exception:  # noqa: BLE001
+            error_codes = {}
+        return {
+            "providers": providers,
+            "activeProviderId": (
+                provider_profile.active_profile().provider_id
+                if provider_profile.active_profile() else None
+            ),
+            "recentErrorCodes": error_codes,
+            "externalTelemetry": False,
+        }
+
+    @server.method("model.conformance")
+    def model_conformance(params: dict[str, Any]) -> dict[str, Any]:
+        """服务商接入一致性检查（新服务商接入的最小契约；不发网络请求）。"""
+        from .agent import provider_profile
+
+        return provider_profile.conformance(
+            str(params["providerId"]) if params.get("providerId") else None
+        )
+
+    @server.method("agent.compaction_archive")
+    def agent_compaction_archive(params: dict[str, Any]) -> dict[str, Any]:
+        """读取压缩归档（恢复与诊断用）：只按归档 ID 返回完整 transcript。
+
+        归档内容含案件原文，因此只在本地返回，不写日志；调用方需已具备该任务
+        的访问权（任务 ID + 归档 ID 双校验）。
+        """
+        from .agent import context_compaction
+
+        task_id = str(params.get("taskId") or "").strip()
+        archive_id = str(params.get("archiveId") or "").strip()
+        if not task_id or not archive_id:
+            raise ValueError("缺少任务 ID 或归档 ID")
+        messages = context_compaction.read_archive(task_id, archive_id)
+        if messages is None:
+            raise ValueError("归档不存在或无法解密")
+        return {"taskId": task_id, "archiveId": archive_id, "messages": messages}
 
     # ---- 备份与恢复（DEV-FND-006 / DB-006） -------------------------------------
 

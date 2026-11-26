@@ -382,6 +382,7 @@ class AgentRunner:
     def _run(self, task_id: str) -> None:
         cancel = self._cancel_flags[task_id]
         started_ts = time.time()
+        state: dict[str, Any] | None = None
         try:
             task = task_store.get_task(task_id)
             if task["lifecycle"] in ("CANCELLED", "COMPLETED", "COMPLETED_WITH_WARNINGS", "FAILED"):
@@ -391,7 +392,7 @@ class AgentRunner:
             case = require_case_mode(task["caseId"], task["mode"])
             resumed = task.get("stage") == "resume" or task["lifecycle"] in ("CANCELLED", "FAILED", "CANCELLING", "WAITING_HUMAN")
 
-            state: dict[str, Any] = {
+            state = {
                 "task_id": task_id,
                 "case_id": task["caseId"],
                 "mode": task["mode"],
@@ -407,6 +408,11 @@ class AgentRunner:
                 "history": task.get("history") or [],
                 "cancel_event": cancel,
                 "selected_document_ids": task.get("selectedDocumentIds") or [],
+                # 交付契约（P0-04）：任务启动即在 submission/ 生成骨架，运行中周期性回写
+                "deliverables": task.get("deliverables") or [],
+                # 任务级预算覆盖（B-02）：由 agent.start 的 budget 入参带入，
+                # 统一由 agent/budget.py 记账
+                "budget_overrides": task.get("budget") or {},
                 # 会话持久化锚点（V26）：同会话任务共享全文历史
                 "conversation_id": task.get("conversationId"),
             }
@@ -477,9 +483,45 @@ class AgentRunner:
                             repair_left = ckpt["state"].get("repairRoundsLeft")
                             if isinstance(repair_left, int):
                                 state["_repair_rounds_left"] = repair_left
-                            explore_used = (ckpt["state"].get("budget") or {}).get("exploreRoundsUsed")
+                            budget_state = ckpt["state"].get("budget") or {}
+                            explore_used = budget_state.get("exploreRoundsUsed")
                             if isinstance(explore_used, int):
                                 state["_explore_rounds_used"] = explore_used
+                            # 预算恢复完整性（B-02 §4.4）：模型调用、Token 与已用轮次
+                            # 一并续接，避免续跑后重新获得预算
+                            model_used = budget_state.get("modelCallsUsed")
+                            if isinstance(model_used, int):
+                                state["_model_calls_used"] = model_used
+                            reserved = budget_state.get("deliveryReservedRounds")
+                            if isinstance(reserved, int):
+                                state["_delivery_reserved"] = reserved
+                            restored_tokens = {
+                                "prompt": int(budget_state.get("promptTokens") or 0),
+                                "completion": int(budget_state.get("completionTokens") or 0),
+                            }
+                            if restored_tokens["prompt"] or restored_tokens["completion"]:
+                                state["_restored_tokens"] = restored_tokens
+                            # 效率计数随检查点续接（B-02 §4.4）：续跑后的重复读取/检索率
+                            # 按任务累计，而不是从 0 重新开始；缓存本身不落检查点。
+                            efficiency = ckpt["state"].get("efficiency")
+                            if isinstance(efficiency, dict):
+                                from .autonomous import _efficiency
+
+                                eff = _efficiency(state)
+                                for key in ("searches", "duplicateSearches", "emptySearches",
+                                            "repeatedReads", "repeatedReadPages"):
+                                    value = efficiency.get(key)
+                                    if isinstance(value, int):
+                                        eff[key] = value
+                                for key in ("readsByOrigin", "searchesByOrigin", "toolCalls"):
+                                    value = efficiency.get(key)
+                                    if isinstance(value, dict):
+                                        eff[key] = {str(k): int(v or 0)
+                                                    for k, v in value.items()}
+                            # 运行时版本钉住（§4.4）：恢复不跨 V1/V2
+                            runtime_version = ckpt["state"].get("runtimeVersion")
+                            if runtime_version in ("v1", "v2", "v3", "legacy"):
+                                state["_runtime_version"] = runtime_version
                         task_store.append_event(task_id, "resume", {
                             "fromNode": ckpt.get("node"),
                             "restoredMessages": len(messages),
@@ -535,13 +577,22 @@ class AgentRunner:
             if state.get("conversation_id"):
                 try:
                     from .. import conversation as conversation_store
+                    from .. import conversation_search
 
                     answer = str((result or {}).get("answer") or "")
                     if answer.strip():
-                        conversation_store.append_pair(
-                            str(state["conversation_id"]), task_id,
-                            str(task.get("request") or ""), answer,
-                        )
+                        # 归档同时写入检索索引（WP05）：检索命中必须能定位真实消息；
+                        # 索引失败不影响会话归档（`append_pair_indexed` 内部已降级）。
+                        try:
+                            conversation_search.append_pair_indexed(
+                                str(state["conversation_id"]), task_id,
+                                str(task.get("request") or ""), answer,
+                            )
+                        except Exception:  # noqa: BLE001 索引/归档异常退回原归档路径
+                            conversation_store.append_pair(
+                                str(state["conversation_id"]), task_id,
+                                str(task.get("request") or ""), answer,
+                            )
                 except Exception:
                     pass
         except task_store.TaskCancelled:
@@ -600,6 +651,24 @@ class AgentRunner:
                 },
             )
             task_store.update_lifecycle(task_id, "FAILED")
+
+        finally:
+            # V3 任务结束（完成/取消/失败/等待人工）都释放租约，保留 fencing token
+            # 单调性；释放失败不影响任务结论（下次启动 takeover 会接管）。
+            if state is not None:
+                try:
+                    from . import tool_runtime
+
+                    tool_runtime.release(state)
+                except Exception:  # noqa: BLE001
+                    pass
+                # 未终态子代理不得在任务结束后永久显示「执行中」（§7.5）
+                try:
+                    from . import subagent_runs
+
+                    subagent_runs.release_task(task_id)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def shutdown(self, timeout: float = 10.0) -> None:
         """通知 worker 退出并等待在跑任务收尾（排队中的任务不再执行）。"""

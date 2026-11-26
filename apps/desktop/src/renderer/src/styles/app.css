@@ -3046,3 +3046,61 @@ body.col-resizing { cursor: col-resize !important; user-select: none; }
 }
 .cw-action-hint .icon { width: 12px; height: 12px; flex: none; }
 .cw-action-hint .cw-spin { width: 11px; height: 11px; margin-top: 0; border-width: 1.5px; }
+
+/* —— 恢复中心（§7.1）：失败/unknown 任务与人工处置入口 —— */
+.recovery-card { width: 880px; height: min(640px, calc(100vh - 96px)); }
+.recovery-head-right { display: flex; align-items: center; gap: 6px; }
+.recovery-body { padding: 8px 18px 14px; overflow: hidden; display: flex; flex: 1; min-height: 0; }
+.recovery-grid { display: grid; grid-template-columns: 300px 1fr; gap: 14px; flex: 1; min-height: 0; width: 100%; }
+.recovery-list { display: flex; flex-direction: column; gap: 6px; overflow-y: auto; padding-right: 4px; }
+.recovery-item {
+  display: flex; flex-direction: column; gap: 5px; text-align: left;
+  padding: 10px 11px; border: 1px solid var(--line); border-radius: 10px;
+  background: #fff; transition: all .15s; min-width: 0;
+}
+.recovery-item:hover { border-color: #bcd2ff; }
+.recovery-item.on { border-color: var(--blue-500); background: var(--blue-50); }
+.recovery-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.recovery-mode { font-size: 12px; font-weight: 600; color: var(--ink-900); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recovery-sub { font-size: 10.5px; color: var(--ink-400); }
+.recovery-sub .mono { font-variant-numeric: tabular-nums; }
+.recovery-detail { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding-right: 4px; min-width: 0; }
+.recovery-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.modal-sub { font-size: 11px; color: var(--ink-400); line-height: 1.6; }
+.recovery-actions { display: flex; align-items: center; gap: 8px; flex: none; }
+.recovery-section { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.recovery-section-title {
+  display: flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 600; color: var(--ink-700);
+}
+.recovery-section-title .icon { width: 13px; height: 13px; color: var(--blue-600); }
+.recovery-sub-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff;
+  font-size: 11px; color: var(--ink-500);
+}
+.recovery-question {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--ink-700);
+}
+
+/* —— 会话管理 / 学习提案 / 扩展审批 / 模型健康：共用的单栏内容区 —— */
+.conv-pane { display: flex; flex-direction: column; gap: 10px; width: 100%; min-height: 0; overflow-y: auto; padding-right: 4px; }
+.conv-search-bar { display: flex; align-items: center; gap: 8px; flex: none; }
+.conv-search-bar .form-input { flex: 1; }
+.conv-hint { font-size: 10.5px; color: var(--ink-400); line-height: 1.65; }
+.conv-hint strong { color: var(--ink-700); font-weight: 600; }
+.learn-diff { font-size: 11px; color: var(--ink-500); }
+.learn-diff summary { cursor: pointer; padding: 2px 0; }
+.plugin-list { display: flex; flex-direction: column; gap: 6px; }
+.cap-row {
+  display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: 8px; background: #fff; font-size: 11.5px;
+}
+.cap-row.blocked { background: #fdf3f1; border-color: #f2c4bd; }
+.cap-row input { margin-top: 1px; flex: none; }
+.cap-name { flex: none; font-weight: 600; color: var(--ink-900); }
+.cap-risk { flex: 1; min-width: 0; color: var(--ink-400); line-height: 1.55; }
+.plugin-manifest { min-height: 84px; resize: vertical; font-family: Consolas, monospace; font-size: 11px; }
+.cq-row.bad { border-color: #f2c4bd; background: #fdf8f7; }
+
+

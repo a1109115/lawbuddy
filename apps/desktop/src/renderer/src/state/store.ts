@@ -134,6 +134,66 @@ export interface TaskChatItem {
   progress?: string
 }
 
+/** turn_complete 汇总（轮数/结束原因/用时/完成守门/工作进度/交付与预算） */
+export interface TaskTurnSummary {
+  rounds: number
+  reason: string
+  /** 轮数用尽后追发无工具调用强制作答（结论已产出） */
+  forcedFinal?: boolean
+  promptTokens?: number
+  completionTokens?: number
+  durationMs?: number
+  /** 完成守门结论（05 方案 §7）：ok=false 时有明确列出的待核实/未读/产物警告 */
+  finalize?: {
+    ok: boolean
+    taskDepth: string
+    warnings: Array<{ code: string; text: string; files?: string[] }>
+    coverage: {
+      required: boolean
+      totalPages: number
+      readPages: number
+      unread: number
+      excluded?: number
+    }
+  }
+  /** 工作进度（B-05）：数值来自工作账本，不由模型文本推断 */
+  workProgress?: {
+    units?: {
+      total: number
+      committed: number
+      needsHuman: number
+      blocked: number
+      terminal: number
+      terminalRatio: number
+    }
+    cells?: { total: number; committed: number; needsHuman: number; blocked: number; stale?: number }
+    delivery?: {
+      status: string
+      artifactCount: number
+      completeCount: number
+      incomplete: string[]
+      rowsExpected: number
+      rowsCommitted: number
+      rowCoverage: number
+    }
+    currentUnit?: { workUnitId: string; scopeType: string; attempts: number } | null
+  }
+  /** 交付状态（B-05）：complete 全部行覆盖；partial 有内容未覆盖 */
+  delivery?: {
+    status: string
+    artifacts: Array<{ name: string; status: string; rows?: number; rowsExpected?: number }>
+    gaps: Array<{ artifact: string; status: string; missingRows?: number; invalidCells?: number }>
+  }
+  /** 预算快照（B-05）：阶段与已用/上限 */
+  budget?: {
+    stage?: string
+    limits?: Record<string, number>
+    used?: Record<string, unknown>
+    reasons?: string[]
+    deliveryReservedRounds?: number
+  }
+}
+
 export type Msg =
   | {
       id: string
@@ -154,27 +214,7 @@ export type Msg =
       chat?: TaskChatItem[] // 自主 Loop 消息流（assistant / tool / toolResult，追加式）
       startedAt?: number // 任务发起时刻（epoch ms）：执行中实时计时与总耗时兜底
       endedAt?: number // 任务到达终态时刻（epoch ms）：气泡底部「完成于」展示
-      turn?: {
-        rounds: number
-        reason: string
-        forcedFinal?: boolean // 轮数用尽后追发无工具调用强制作答（结论已产出）
-        promptTokens?: number
-        completionTokens?: number
-        durationMs?: number // 任务总用时
-        /** 完成守门结论（05 方案 §7）：ok=false 时有明确列出的待核实/未读/产物警告 */
-        finalize?: {
-          ok: boolean
-          taskDepth: string
-          warnings: Array<{ code: string; text: string; files?: string[] }>
-          coverage: {
-            required: boolean
-            totalPages: number
-            readPages: number
-            unread: number
-            excluded?: number
-          }
-        }
-      } // turn_complete：轮数、结束原因与用时
+      turn?: TaskTurnSummary // turn_complete：轮数、结束原因、工作进度与交付状态
       body?: AiMessageBody
       streamText?: string // 流式累积原始文本（message_delta 覆盖式 / text 追加式）
       streamPreview?: string // 可读成稿片段（message_delta.preview，优先渲染）
@@ -627,6 +667,18 @@ interface AppState {
   artExpanded: boolean
   // —— 审计查看器 ——
   auditOpen: boolean
+  // —— 恢复中心（§7.1：失败/中断/待处置任务的技术状态与人工出口） ——
+  recoveryOpen: boolean
+  /** 恢复中心打开的页签（恢复处置 / 子代理进度 / 本地巡检） */
+  recoveryTab: 'recovery' | 'subagents' | 'automation'
+  // —— 会话管理（§7.2：搜索 / 分支 / 彻底删除 / 产物快照） ——
+  conversationOpen: boolean
+  // —— 学习提案（§7.4：记忆提案与技能暂存版本） ——
+  learningOpen: boolean
+  // —— 扩展审批（§7.6：插件与 MCP 的能力授予） ——
+  pluginOpen: boolean
+  // —— 模型健康（§7.3：服务商配置状态与最近错误类别） ——
+  modelHealthOpen: boolean
   // —— 待核实队列（PRD 11.4 / R-007 / R-008） ——
   claimsQueueOpen: boolean
   pendingClaims: ClaimSummary[]
@@ -756,6 +808,11 @@ interface AppState {
   toggleArtPin: () => void
   toggleArtExpanded: () => void
   setAuditOpen: (v: boolean) => void
+  setRecoveryOpen: (v: boolean, tab?: 'recovery' | 'subagents' | 'automation') => void
+  setConversationOpen: (v: boolean) => void
+  setLearningOpen: (v: boolean) => void
+  setPluginOpen: (v: boolean) => void
+  setModelHealthOpen: (v: boolean) => void
   setClaimsQueueOpen: (v: boolean) => void
   openClaimsQueue: () => void
   loadClaimsQueue: () => Promise<void>
@@ -1158,6 +1215,19 @@ function reduceTaskEvents(m: TaskMsg, fresh: AgentTaskEvent[]): TaskMsg {
                   excluded: Number((rawFinalize.coverage as Record<string, unknown> | undefined)?.excluded ?? 0)
                 }
               }
+            : undefined,
+        // 工作进度、交付状态与预算（B-05）：直接透传账本数值，不做前端推断
+        workProgress:
+          p.workProgress && typeof p.workProgress === 'object'
+            ? (p.workProgress as TaskTurnSummary['workProgress'])
+            : undefined,
+        delivery:
+          p.delivery && typeof p.delivery === 'object'
+            ? (p.delivery as TaskTurnSummary['delivery'])
+            : undefined,
+        budget:
+          p.budget && typeof p.budget === 'object'
+            ? (p.budget as TaskTurnSummary['budget'])
             : undefined
       }
     } else if (e.type === 'message_delta') {
@@ -1231,6 +1301,99 @@ function reduceTaskEvents(m: TaskMsg, fresh: AgentTaskEvent[]): TaskMsg {
           (p.linkedCase ? ` · 只读共享 ${shared} 份` : '') +
           ` · 共 ${Number(p.totalPages ?? 0)} 页` +
           (Number(p.ocrPendingPages ?? 0) ? ` · OCR 待完成 ${Number(p.ocrPendingPages)} 页` : '')
+      })
+    } else if (e.type === 'deliverable_skeleton') {
+      // 交付物骨架（P0-04）：任务启动即落盘，让用户知道"任何时刻中断都有可评分产出"
+      const files = Array.isArray(p.files) ? (p.files as Record<string, unknown>[]) : []
+      const names = files
+        .map((f) => `${String(f.name ?? '')}${f.created === true ? '（新建）' : '（沿用）'}`)
+        .filter((x) => x.trim() !== '')
+      if (names.length) {
+        steps.push({
+          label: `准备交付物（${String(p.directory ?? 'submission')}/）`,
+          state: 'done',
+          detail: names.join('、')
+        })
+      }
+    } else if (e.type === 'deliverable_wrap_up') {
+      // 预算将尽进入收尾：停止新检索，仅回写已确认结论（避免零产出）
+      steps.push({
+        label: '进入收尾模式',
+        state: 'done',
+        detail: `第 ${Number(p.round ?? 0)} 轮起停止新检索，回写已确认结论`
+      })
+    } else if (e.type === 'work_unit_update') {
+      // 工作单元进度（B-05）：终态/总数与已提交/待核实数量直接来自工作账本
+      const progress = (p.progress ?? {}) as Record<string, unknown>
+      const total = Number(progress.total ?? p.total ?? 0)
+      const staleCells = Number(p.staleCells ?? 0)
+      const staleUnits = Number(p.staleUnits ?? 0)
+      const staleReading = Number(p.staleReading ?? 0)
+      const staleEvidence = Number(p.staleEvidence ?? 0)
+      if (staleCells || staleUnits || staleReading || staleEvidence) {
+        steps.push({
+          label: '文档版本变化',
+          state: 'done',
+          detail:
+            `旧答案失效 ${staleCells}` +
+            ` · 工作单元退回 ${staleUnits}` +
+            ` · 阅读记录失效 ${staleReading}` +
+            ` · 证据失效 ${staleEvidence}`
+        })
+      }
+      if (total > 0) {
+        const terminal = Number(progress.terminal ?? 0)
+        const committed = Number(progress.committed ?? 0)
+        const needsHuman = Number(progress.needsHuman ?? 0)
+        const blocked = Number(progress.blocked ?? 0)
+        const status = String(p.status ?? '')
+        const lastError = String(p.lastErrorCode ?? p.reasonCode ?? '')
+        const label = status === 'leased' ? '处理工作单元' : '工作单元更新'
+        steps.push({
+          label,
+          state: status === 'leased' ? 'active' : 'done',
+          detail:
+            `${String(p.workUnitId ?? '')} · 终态 ${terminal}/${total}` +
+            ` · 已提交 ${committed}` +
+            (needsHuman ? ` · 待核实 ${needsHuman}` : '') +
+            (blocked ? ` · 阻塞 ${blocked}` : '') +
+            (lastError ? ` · 原因 ${lastError}` : '')
+        })
+      }
+    } else if (e.type === 'artifact_commit') {
+      // 交付物原子提交（B-05）：写后已重读校验，状态来自校验而不是写入返回值
+      const status = String(p.status ?? '')
+      steps.push({
+        label: `交付 ${String(p.name ?? '')}`,
+        state: status === 'complete' ? 'done' : 'active',
+        detail:
+          `${status === 'complete' ? '完整' : status === 'partial' ? '部分覆盖' : '无效'}` +
+          ` · ${Number(p.rows ?? 0)}/${Number(p.rowsExpected ?? 0)} 行`
+      })
+    } else if (e.type === 'budget_update') {
+      // 预算阶段变化（B-05）：warn/blocked 时列出真实原因，不静默降级
+      const stage = String(p.stage ?? 'ok')
+      const reasons = Array.isArray(p.reasons) ? (p.reasons as string[]) : []
+      if (stage !== 'ok') {
+        steps.push({
+          label: stage === 'blocked' ? '预算已达上限' : '预算接近上限',
+          state: 'done',
+          detail: reasons.length ? reasons.join('；') : '已按预算降级'
+        })
+      }
+    } else if (e.type === 'run_recovered') {
+      // 从检查点恢复（B-05）：续接的轮次/调用/Token 计数，说明预算没有被重置
+      steps.push({
+        label: '从检查点恢复任务',
+        state: 'done',
+        detail:
+          `已用轮次 ${Number(p.roundsUsed ?? 0)}` +
+          ` · 工具调用 ${Number(p.toolCallsUsed ?? 0)}` +
+          ` · 模型调用 ${Number(p.modelCallsUsed ?? 0)}` +
+          (Number(p.tokens ?? 0) ? ` · Token ${Number(p.tokens ?? 0)}` : '') +
+          (Number(p.deliveryReservedRounds ?? 0)
+            ? ` · 交付保留 ${Number(p.deliveryReservedRounds)} 轮`
+            : '')
       })
     } else if (e.type === 'verification') {
       const warnings = Array.isArray(p.warnings) ? (p.warnings as string[]).join('；') : ''
@@ -1590,6 +1753,12 @@ export const useApp = create<AppState>((set, get) => {
     artPinned: false,
     artExpanded: false,
     auditOpen: false,
+    recoveryOpen: false,
+    recoveryTab: 'recovery',
+    conversationOpen: false,
+    learningOpen: false,
+    pluginOpen: false,
+    modelHealthOpen: false,
     claimsQueueOpen: false,
     pendingClaims: [],
     staleClaims: [],
@@ -2936,6 +3105,16 @@ export const useApp = create<AppState>((set, get) => {
     toggleArtExpanded: () => set((s) => ({ artExpanded: !s.artExpanded })),
 
     setAuditOpen: (v) => set({ auditOpen: v }),
+
+    setRecoveryOpen: (v, tab) => set({ recoveryOpen: v, ...(tab ? { recoveryTab: tab } : {}) }),
+
+    setConversationOpen: (v) => set({ conversationOpen: v }),
+
+    setLearningOpen: (v) => set({ learningOpen: v }),
+
+    setPluginOpen: (v) => set({ pluginOpen: v }),
+
+    setModelHealthOpen: (v) => set({ modelHealthOpen: v }),
 
     setClaimsQueueOpen: (v) => set({ claimsQueueOpen: v }),
 

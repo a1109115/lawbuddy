@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LawBuddy Agent Harness 改造进度汇报（2026-11-16）</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --text: #1f2328;
+    --muted: #6b7280;
+    --line: #e5e7eb;
+    --green: #16a34a;
+    --green-soft: #eaf7ee;
+    --amber: #d97706;
+    --amber-soft: #fdf4e6;
+    --red: #dc2626;
+    --red-soft: #fdecec;
+    --blue: #2563eb;
+    --blue-soft: #eaf0fe;
+    --gray-soft: #f0f1f3;
+    --radius: 12px;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .04), 0 8px 24px rgba(16, 24, 40, .05);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+  }
+  .page { max-width: 1080px; margin: 0 auto; padding: 40px 24px 64px; }
+  header.hero { padding: 8px 0 28px; border-bottom: 1px solid var(--line); }
+  .eyebrow { font-size: 13px; letter-spacing: .12em; color: var(--muted); text-transform: uppercase; }
+  h1 { font-size: 30px; line-height: 1.3; margin: 10px 0 8px; letter-spacing: -.01em; }
+  .sub { color: var(--muted); margin: 0; }
+  .meta { margin-top: 14px; font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 8px 18px; }
+  h2 { font-size: 21px; margin: 44px 0 14px; letter-spacing: -.01em; }
+  h3 { font-size: 16px; margin: 0 0 6px; }
+  p { margin: 8px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+    box-shadow: var(--shadow); padding: 22px;
+  }
+  .grid { display: grid; gap: 16px; }
+  .g3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .g2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .g4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  @media (max-width: 860px) { .g3, .g4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 600px) { .g3, .g2, .g4 { grid-template-columns: 1fr; } h1 { font-size: 24px; } }
+
+  .note { font-size: 13px; color: var(--muted); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+
+  .tag { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+  .tag::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .t-green { color: var(--green); background: var(--green-soft); }
+  .t-amber { color: var(--amber); background: var(--amber-soft); }
+  .t-red { color: var(--red); background: var(--red-soft); }
+  .t-blue { color: var(--blue); background: var(--blue-soft); }
+  .t-gray { color: var(--muted); background: var(--gray-soft); }
+
+  .kpi { display: flex; align-items: center; gap: 18px; }
+  .donut {
+    width: 104px; height: 104px; border-radius: 50%; flex: 0 0 auto;
+    background: conic-gradient(var(--green) 0 61.9%, var(--gray-soft) 61.9% 100%);
+    display: grid; place-items: center; position: relative;
+  }
+  .donut::after { content: ""; position: absolute; inset: 11px; background: var(--card); border-radius: 50%; }
+  .donut span { position: relative; z-index: 1; font-size: 24px; font-weight: 700; }
+  .kpi-num { font-size: 26px; font-weight: 700; line-height: 1.2; }
+  .kpi-label { font-size: 13px; color: var(--muted); }
+
+  .bar-row { margin: 14px 0; }
+  .bar-head { display: flex; justify-content: space-between; font-size: 13.5px; margin-bottom: 6px; }
+  .bar-track { height: 10px; background: var(--gray-soft); border-radius: 999px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 999px; background: var(--green); }
+  .bar-fill.blue { background: var(--blue); }
+  .bar-fill.amber { background: var(--amber); }
+  .bar-fill.gray { background: #c9cdd4; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 11px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 12.5px; color: var(--muted); font-weight: 600; background: #fbfbfc; }
+  tr:last-child td { border-bottom: none; }
+  td.nowrap { white-space: nowrap; }
+
+  ul.clean { margin: 8px 0 0; padding-left: 20px; }
+  ul.clean li { margin: 6px 0; }
+
+  .list-card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; }
+  .list-card .head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 6px; }
+  .list-card .why { color: var(--muted); font-size: 13.5px; }
+
+  .callout { border-left: 4px solid var(--amber); background: var(--amber-soft); padding: 14px 16px; border-radius: 8px; font-size: 14px; }
+  .callout.green { border-color: var(--green); background: var(--green-soft); }
+  .callout.red { border-color: var(--red); background: var(--red-soft); }
+  .callout strong { font-weight: 700; }
+
+  .step { display: flex; gap: 14px; margin: 14px 0; }
+  .step .no {
+    flex: 0 0 26px; height: 26px; border-radius: 50%; background: var(--blue); color: #fff;
+    display: grid; place-items: center; font-size: 13px; font-weight: 700; margin-top: 2px;
+  }
+  .step .body { flex: 1; }
+  .step .body b { display: block; }
+
+  footer { margin-top: 46px; padding-top: 18px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--muted); }
+  .kv { display: grid; grid-template-columns: 132px 1fr; gap: 6px 14px; font-size: 13.5px; }
+  .kv div:nth-child(odd) { color: var(--muted); }
+  @media print {
+    body { background: #fff; }
+    .card, .list-card { box-shadow: none; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="hero">
+    <div class="eyebrow">LB-HARNESS-2026-01 · 进度汇报</div>
+    <h1>Agent Harness 优化改造：开发与测试进度</h1>
+    <p class="sub">对标 <span class="mono">docs/agent-harness-upgrade-plan.md</span>，用大白话说明现在做到哪一步、哪些已经验证、哪些还没开始。</p>
+    <div class="meta">
+      <span>汇报日期：2026-11-16</span>
+      <span>代码基线：V50 迁移 / eaa0c10（含未提交改动）</span>
+      <span>证据来源：代码实查 + 本机实测</span>
+    </div>
+  </header>
+
+  <h2>先看结论</h2>
+  <div class="grid g3">
+    <div class="card">
+      <div class="kpi">
+        <div class="donut"><span>62%</span></div>
+        <div>
+          <div class="kpi-num">13 / 21 项</div>
+          <div class="kpi-label">方案工作项已完成</div>
+        </div>
+      </div>
+      <p class="note" style="margin-top:14px">按 A/B/C/D 四个阶段的 21 个条目计数，不是按工作量或时间估算。</p>
+    </div>
+    <div class="card">
+      <h3>做完了什么</h3>
+      <p>改造本身（阶段 A + B）已经全部落地：数据库、账本、预算、调度、交付、检索、上下文、子代理、界面进度都已接上。</p>
+      <p class="note">确定性测试（不调用真实模型）全部通过。</p>
+    </div>
+    <div class="card">
+      <h3>还差什么</h3>
+      <p>差“用真实模型跑分”和“上线灰度”：001/013/019 三次复测、22 题全量回归、效率报告、安装包候选版、灰度与回滚演练。</p>
+      <p class="note">这些需要模型配置、数据快照和长时间运行。</p>
+    </div>
+  </div>
+
+  <div class="callout green" style="margin-top:16px">
+    <strong>一句话总结：</strong>“新引擎”已经装好并通过了台架测试，但还没有上路实测，也没有开始对外载客。
+  </div>
+
+  <h2>四个阶段走到哪了</h2>
+  <div class="card">
+    <div class="bar-row">
+      <div class="bar-head"><span><b>阶段 A · 准备</b>（基线、备份、设计、验收矩阵）</span><span>4 / 4 · 已完成</span></div>
+      <div class="bar-track"><div class="bar-fill" style="width:100%"></div></div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-head"><span><b>阶段 B · 开发改造</b>（账本、预算、调度、交付、检索、界面）</span><span>6 / 6 · 已完成</span></div>
+      <div class="bar-track"><div class="bar-fill" style="width:100%"></div></div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-head"><span><b>阶段 C · 测试验证</b>（静态回归、迁移、故障注入、真实复测）</span><span>3 / 6 · 进行中</span></div>
+      <div class="bar-track"><div class="bar-fill blue" style="width:50%"></div></div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-head"><span><b>阶段 D · 上线切换</b>（候选包、20+50 灰度、全量、收尾）</span><span>0 / 5 · 未开始</span></div>
+      <div class="bar-track"><div class="bar-fill gray" style="width:0%"></div></div>
+    </div>
+    <p class="note">C 阶段卡住的不是代码，而是“需要真实模型与数据快照的长跑验证”；D 阶段必须在 C 阶段硬门槛通过后才能开始。</p>
+  </div>
+
+  <h2>这次改了什么：小白版能力地图</h2>
+  <p>把方案里的技术名词翻译成日常角色，就很好理解了。</p>
+  <div class="grid g2">
+    <div class="list-card">
+      <div class="head"><h3>工作账本 = 施工进度表</h3><span class="tag t-green">已落地</span></div>
+      <p class="why">以前 AI 靠聊天记忆，格子一多就忘；现在 300 个格子逐条登记“没做 / 在做 / 已交 / 待人看 / 卡住”，页面刷新也不丢。</p>
+      <p class="note mono">work_ledger.py · agent_work_units / agent_cell_results</p>
+    </div>
+    <div class="list-card">
+      <div class="head"><h3>任务契约 = 工程量清单</h3><span class="tag t-green">已落地</span></div>
+      <p class="why">开工前先算清楚“20 份协议 × 15 个问题 = 300 格”，并声明要交哪些文件；不是让 AI 边聊边猜。</p>
+      <p class="note mono">work_contract.py · V50 迁移</p>
+    </div>
+    <div class="list-card">
+      <div class="head"><h3>统一预算 = 时间与额度</h3><span class="tag t-green">已落地</span></div>
+      <p class="why">轮次、工具调用、模型调用、Token、实际耗时都记在同一个本子上；中断后接着算，不会“重开一局又满血”。</p>
+      <p class="note mono">budget.py · scheduler.split_budget</p>
+    </div>
+    <div class="list-card">
+      <div class="head"><h3>调度器 = 工头派活</h3><span class="tag t-green">已落地</span></div>
+      <p class="why">优先做能解锁别人的活，再做没试过的活；某个格子连续失败就标“要人看”，不拖垮整个任务。</p>
+      <p class="note mono">scheduler.py</p>
+    </div>
+    <div class="list-card">
+      <div class="head"><h3>交付控制器 = 收尾装订员</h3><span class="tag t-green">已落地</span></div>
+      <p class="why">到点就补齐整张表的行、原子写文件、算派生汇总、写完再读回来校验；交不齐会明确显示“部分交付”。</p>
+      <p class="note mono">delivery_controller.py · aggregate.py</p>
+    </div>
+    <div class="list-card">
+      <div class="head"><h3>上下文组装器 = 只发当前一页资料</h3><span class="tag t-green">已落地</span></div>
+      <p class="why">每次只把当前格子需要的证据和缺口给模型，不再把整本卷宗一遍遍塞进对话，省 Token 也更准。</p>
+      <p class="note mono">context_builder.py</p>
+    </div>
+    <div class="list-card">
+      <div class="head"><h3>工作型子代理 = 临时助手</h3><span class="tag t-green">已落地</span></div>
+      <p class="why">助手只做指定的格子、只写暂存区，不能直接改正式交付物；重复提交会被编号去重。</p>
+      <p class="note mono">worker.py · concurrency.py</p>
+    </div>
+    <div class="list-card">
+      <div class="head"><h3>检索范围缓存 = 按书架借书</h3><span class="tag t-green">已落地</span></div>
+      <p class="why">同一个词，在 A 合同和 B 合同里的结果分开放；文档换版后旧缓存自动失效，不会拿旧答案冒充新证据。</p>
+      <p class="note mono">autonomous.py 检索范围键 · search.py</p>
+    </div>
+    <div class="list-card">
+      <div class="head"><h3>双状态进度 = “在做”与“交齐”分开说</h3><span class="tag t-green">已落地</span></div>
+      <p class="why">任务“跑完了”不等于“交付齐了”。界面同时显示终态格子数、待核实数、阻塞数、交付文件覆盖和预算进度。</p>
+      <p class="note mono">tasks.py · contracts · ChatView.tsx · store.ts</p>
+    </div>
+  </div>
+
+  <h2>今天实测了什么</h2>
+  <p>下面不是“文档说通过”，而是本次汇报时在本机重新运行得到的实际结果。</p>
+  <div class="card" style="padding:0; overflow:hidden">
+    <table>
+      <thead>
+        <tr><th style="width:44%">检查项</th><th style="width:16%">结果</th><th>说明</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="mono">npm run typecheck</td><td><span class="tag t-green">通过</span></td><td>主进程 + 渲染层 TypeScript 无类型错误</td></tr>
+        <tr><td class="mono">npm run test</td><td><span class="tag t-green">51 / 51</span></td><td>11 个测试文件全部通过</td></tr>
+        <tr><td class="mono">npm run build</td><td><span class="tag t-green">通过</span></td><td>桌面端构建成功</td></tr>
+        <tr><td class="mono">node scripts/scan-secrets.mjs</td><td><span class="tag t-green">通过</span></td><td>扫描 189 个文件，未发现疑似密钥</td></tr>
+        <tr><td class="mono">ruff check .</td><td><span class="tag t-green">通过</span></td><td>Python 静态检查无告警</td></tr>
+        <tr><td class="mono">python -m compileall lawbuddy</td><td><span class="tag t-green">通过</span></td><td>Core 全部模块可编译</td></tr>
+        <tr><td class="mono">python -m evals.m2_baseline</td><td><span class="tag t-green">通过</span></td><td>既有阅卷基线回归正常</td></tr>
+        <tr><td class="mono">python -m evals.m3_budget</td><td><span class="tag t-green">通过</span></td><td>4 项预算门槛全过</td></tr>
+        <tr><td class="mono">python -m evals.m3_evidence</td><td><span class="tag t-green">通过</span></td><td>引用、续读、来源失效校验正常</td></tr>
+        <tr><td class="mono">python -m evals.m3_security</td><td><span class="tag t-green">通过</span></td><td>跨案隔离、只读边界正常</td></tr>
+        <tr><td class="mono">python -m evals.m3_loop_baseline</td><td><span class="tag t-green">通过</span></td><td>旧 Loop 基线记录完成</td></tr>
+        <tr><td class="mono">python -m evals.m3_adaptive_investigation</td><td><span class="tag t-green">通过</span></td><td>缺口驱动修复、检查点、压缩状态正常</td></tr>
+        <tr><td class="mono">python -m evals.m3_db_reliability</td><td><span class="tag t-green">通过</span></td><td>数据库一致性、备份恢复正常</td></tr>
+        <tr><td class="mono">python -m evals.m3_contract</td><td><span class="tag t-green">通过</span></td><td>合同版本对比与原件只读正常</td></tr>
+        <tr><td class="mono">python -m evals.m3_harness</td><td><span class="tag t-green">16 / 16 gate</span></td><td>HAR-T-001～015 及 4 个补充 gate 全过</td></tr>
+        <tr><td class="mono">python -m evals.m3_migration</td><td><span class="tag t-green">7 / 7 用例</span></td><td>V49→V50、异常回滚、旧库兼容、运行时隔离全过</td></tr>
+        <tr><td class="mono">python -m evals.m4_optimizations</td><td><span class="tag t-green">通过</span></td><td>连续三次完整交付、中断后恢复交付正常</td></tr>
+        <tr><td class="mono">python -m evals.wfa_law --profile fast ×2 + --compare</td><td><span class="tag t-green">无差异</span></td><td>同一代码两次评分结果一致，<span class="mono">diffs: []</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">以上全部是“确定性测试”：不调用真实大模型、不需要 API Key，因此只能证明系统机制正确，不能证明真实任务分数。</p>
+
+  <h2>还没做的清单（按依赖顺序）</h2>
+  <div class="grid g2">
+    <div class="list-card">
+      <div class="head"><h3>C-04 代表任务三次复测</h3><span class="tag t-amber">待执行</span></div>
+      <p class="why">用真实模型把 001 / 013 / 019 各跑 3 次，看中位数是否达到硬门槛（001 ≥82.4、019 ≥78.1、013 >0 且 300 行结构 100%）。</p>
+      <p class="note">需要：模型配置 + 数据快照；单次运行时间长。</p>
+    </div>
+    <div class="list-card">
+      <div class="head"><h3>C-05 22 题全量回归</h3><span class="tag t-amber">待执行</span></div>
+      <p class="why">定向链路平均分 ≥29.6，自主链路 22/22 有结构交付物，且无跨案、无真值路径访问。</p>
+      <p class="note">依赖 C-04 通过。</p>
+    </div>
+    <div class="list-card">
+      <div class="head"><h3>C-06 性能与成本</h3><span class="tag t-amber">待采集</span></div>
+      <p class="why">统计“每提交格 Token”、重复读取率、重复检索率。采集代码已经写好，但还没有真实 V2 运行数据。</p>
+      <p class="note">依赖 C-04 的真实日志。</p>
+    </div>
+    <div class="list-card">
+      <div class="head"><h3>D-01 候选安装包</h3><span class="tag t-gray">未开始</span></div>
+      <p class="why">重新打包含新代码的安装包与 Core freeze，跑冒烟与敏感扫描，在隔离工作区验证升级。</p>
+      <p class="note">当前 release 里的安装包是 11 月 6 日构建的，早于本次改造。</p>
+    </div>
+    <div class="list-card">
+      <div class="head"><h3>D-02 / D-03 灰度</h3><span class="tag t-gray">未开始</span></div>
+      <p class="why">先 20 个真实 V2 任务，再扩到 50 个，覆盖阅卷、合同、文书三种模式，逐单核对结构交付与恢复。</p>
+      <p class="note">依赖 D-01 与 C 阶段硬门槛。</p>
+    </div>
+    <div class="list-card">
+      <div class="head"><h3>D-04 / D-05 全量与收尾</h3><span class="tag t-gray">未开始</span></div>
+      <p class="why">全量切到 V2、保留 V1 旧任务恢复能力、归档新基线，再做一次 22 题回归。</p>
+      <p class="note">完成定义还要求回滚演练真实执行过。</p>
+    </div>
+  </div>
+
+  <h2>需要特别提醒的三件事</h2>
+  <div class="grid g2">
+    <div class="card">
+      <h3>1. 代码默认已经是 V2</h3>
+      <p>带交付物的新任务默认按 V2 运行（<span class="mono">agent.runtimeVersion</span> 默认 v2），但真实模型验收和灰度都还没做。</p>
+      <p class="note">建议：在 C-04/C-05 完成前，把正式工作区的运行时开关显式设为 v1，或只在隔离工作区使用 v2。</p>
+    </div>
+    <div class="card">
+      <h3>2. “测试全绿”只覆盖确定性范围</h3>
+      <p>16 项 Harness gate、迁移 7 用例、静态检查都过了，说明机制正确；但分数、Token 效率、长任务稳定性还没有真实数据。</p>
+      <p class="note">不要把确定性通过当成“改造目标已达成”。</p>
+    </div>
+    <div class="card">
+      <h3>3. 安装包尚未更新</h3>
+      <p>仓库里的 <span class="mono">release</span> 安装包和 <span class="mono">dist_core</span> 都是 11 月 6 日的产物，不包含本次 Harness 改造。</p>
+      <p class="note">对外演示或试用前必须重新执行打包与冒烟流程。</p>
+    </div>
+    <div class="card">
+      <h3>4. 仓库里有大量调试脚本</h3>
+      <p>根目录约 70 个 <span class="mono">_wfa_*.py</span> 调试脚本尚未清理，也没有纳入版本管理。</p>
+      <p class="note">不影响功能，但会影响交付整洁度，建议在 D-01 前归档到临时目录。</p>
+    </div>
+  </div>
+
+  <h2>建议的下一步</h2>
+  <div class="card">
+    <div class="step">
+      <div class="no">1</div>
+      <div class="body"><b>先跑通一次真实模型冒烟</b>用一个最简单的合同任务，确认 V2 链路能完整走完并生成交付物，再启动三次复测。</div>
+    </div>
+    <div class="step">
+      <div class="no">2</div>
+      <div class="body"><b>按 C-04 → C-05 → C-06 顺序执行</b>三次复测通过后再做 22 题全量，最后用真实日志算效率；任何一项失败先修代码，不要用调提示词“凑分”。</div>
+    </div>
+    <div class="step">
+      <div class="no">3</div>
+      <div class="body"><b>重新出候选包并做隔离升级</b>生成安装包与 Core freeze，跑 <span class="mono">npm run core:smoke</span>、敏感扫描和 V49→V50 隔离升级。</div>
+    </div>
+    <div class="step">
+      <div class="no">4</div>
+      <div class="body"><b>再进入 20 / 50 任务灰度</b>灰度期间逐单核对结构交付率、预算恢复、跨案召回和用户可见警告；触发 S0/S1 立即回滚。</div>
+    </div>
+  </div>
+
+  <h2>进度是怎么判定的</h2>
+  <div class="card">
+    <div class="kv">
+      <div>已完成的判定</div><div>代码或文档产物存在，且对应验收命令本次实际运行通过，二者缺一不算完成。</div>
+      <div>未开始的判定</div><div>没有产物、没有运行记录，或依赖项尚未满足（例如 D 阶段依赖 C 阶段）。</div>
+      <div>统计口径</div><div>A 阶段 4 项 + B 阶段 6 项 + C 阶段 6 项 + D 阶段 5 项 = 21 项；完成 13 项，占 61.9%，页面取整为 62%。</div>
+      <div>本次运行时间</div><div>2026-11-16 16:42–16:44（Asia/Shanghai），使用本机 <span class="mono">services/core/.venv</span> 与 Node 24。</div>
+      <div>证据位置</div><div class="mono">services/core/evals/reports/ · services/core/evals/reports/harness/baseline/ · services/core/law-fast-v2*.json</div>
+      <div>方案原文</div><div class="mono">docs/agent-harness-upgrade-plan.md</div>
+      <div>配套文档</div><div class="mono">docs/agent-harness-a03-schema-runtime.md · docs/agent-harness-a04-acceptance-matrix.md</div>
+    </div>
+  </div>
+
+  <footer>
+    本报告只陈述本次实际核查与运行结果；未执行的真实模型评测、灰度与回滚演练均标注为“未开始/待执行”，不以文档描述代替证据。
+  </footer>
+</div>
+</body>
+</html>

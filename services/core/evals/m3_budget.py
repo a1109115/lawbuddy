@@ -108,13 +108,22 @@ def _run_limits(report: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
     budget.spend(fresh["id"], "tool_call")
     rows.append({"step": "noWarnBelowThreshold", "ok": budget.snapshot(fresh["id"])["stage"] == "ok"})
 
-    # 预算台账仍按任务持久化（记账层；Loop 本身不再读写它）
-    budget.ensure(task["id"], {"maxToolCalls": 1})
-    budget.spend(task["id"], "tool_call")
-    snap = budget.snapshot(task["id"])
+    # 预算台账按任务持久化且彼此隔离（记账层语义）：自主 Loop 现在也会写预算
+    # （B-02），因此这里用未运行过的任务验证「显式上限生效 + 计数独立」。
+    ledger_task = create_task(case_id=case["id"], mode="legal_review", request_text="预算台账持久化评测")
+    budget.ensure(ledger_task["id"], {"maxToolCalls": 1})
+    budget.spend(ledger_task["id"], "tool_call")
+    snap = budget.snapshot(ledger_task["id"])
+    loop_snap = budget.snapshot(task["id"])
     rows.append({"step": "budgetPersistedPerTask", "ok": snap["used"].get("tool_call", 0) >= 1
                  and snap["limits"].get("maxToolCalls") == 1,
                  "used": snap["used"], "limits": snap["limits"]})
+    # B-02：主循环已接入统一预算，轮次/模型调用/工具调用/Token 均落库
+    rows.append({"step": "loopCountsPersisted",
+                 "ok": loop_snap["used"].get("round", 0) >= 1
+                 and loop_snap["used"].get("model_call", 0) >= 1
+                 and loop_snap["used"].get("tokens", 0) > 0,
+                 "used": loop_snap["used"]})
 
     report["limits"] = {"taskId": task["id"], "warnTaskId": warn_task["id"]}
     ok = all(r["ok"] for r in rows)

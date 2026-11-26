@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # 双周全量回归（§4.9）：每月 1 日与 15 日 02:00 UTC
+  schedule:
+    - cron: '0 2 1,15 * *'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -64,6 +67,148 @@ jobs:
 
       - name: 字节码编译（语法检查）
         run: python -m compileall -q services/core
+
+  # Harness 确定性专项（LB-HARNESS-2026-01 C-03）：不依赖模型、API Key 与数据快照，
+  # 覆盖契约编译/大账本/检索范围/预算恢复/交付控制器/调度/版本失效/并发熔断/
+  # 断连分类/子代理幂等/工作单元端到端/上下文组装。进 PR 门禁。
+  # 平台选择说明：工作空间初始化在无系统密钥环时按 fail-closed 阻断
+  # （keyring.load_or_create_dek → KeyringError），Linux runner 没有 DPAPI /
+  # Secret Service 实现，评测会在 ensure_workspace 阶段直接失败。这里改用
+  # windows-latest（DPAPI 可用、sqlcipher3 提供 cp312 wheel），与被测产品平台一致，
+  # 且不需要为 CI 放宽密钥环约束。
+  harness-deterministic:
+    name: Harness 确定性专项（HAR-T-001~015）
+    runs-on: windows-latest
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      # 评测只需要能建工作空间的最小依赖：SQLCipher（加密库）、cryptography
+      # （文件级加密）、python-docx（演示案件种子里的 DOCX）。不安装
+      # paddle/onnxruntime 等数 GB 的 OCR 依赖。
+      - name: 安装最小依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==0.8.4 "sqlcipher3>=0.6.2" "cryptography>=42.0" "python-docx>=1.1"
+
+      - name: 运行 Harness 专项
+        working-directory: services/core
+        run: python -m evals.m3_harness
+
+      - name: 迁移与兼容验证（C-02）
+        working-directory: services/core
+        run: python -m evals.m3_migration
+
+      - name: 上传 Harness 报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-deterministic-report
+          path: |
+            services/core/evals/reports/m3_harness_*.json
+            services/core/evals/reports/m3_migration_*.json
+          if-no-files-found: warn
+
+  law-regression:
+    name: LAW 域回归评测（评分与聚合口径）
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      # 快速档不依赖模型、外部数据快照与 GPU 依赖：用 2 个代表任务镜像
+      # （合同 deal-point / 刑事 12 被告）验证「评分口径、聚合算子、分批合并
+      # 未被改坏」。官方参考目录不存在时自动退化为本包同语义实现，并在结果里
+      # 标注 scorer=builtin。
+      - name: LAW 快速档回归
+        working-directory: services/core
+        run: python -m evals.wfa_law --profile fast --out law-fast.json
+
+      # 同一 commit 连跑两次并对比：评分必须是确定性的，否则历史分数不可比较
+      # （§4.9 校验方法「同一 commit 两次运行结果一致」）。
+      - name: LAW 评分确定性校验（两次运行对比）
+        working-directory: services/core
+        run: |
+          python -m evals.wfa_law --profile fast --out law-fast-2.json
+          python -m evals.wfa_law --compare law-fast.json law-fast-2.json \
+            | tee law-compare.json
+          grep -q '"ok": true' law-compare.json
+
+      - name: 上传评测结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: law-fast-result
+          path: |
+            services/core/law-fast.json
+            services/core/law-compare.json
+          if-no-files-found: warn
+
+  # 全量档（22 个真实 LAW 任务）不进 PR 门禁：需要 API Key、数据快照与数小时
+  # 运行时间。按 §4.9 安排为双周定时任务，结果以 artifact 形式留档并与上一期
+  # 对比；密钥从仓库 Secret 注入应用内统一密钥管理，不落明文。
+  law-full:
+    name: LAW 域全量回归（双周）
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, law-eval]
+    timeout-minutes: 480
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: 安装 Core 依赖
+        run: pip install -r services/core/requirements.txt
+
+      - name: 全量档运行（22 任务 + Harness 指标）
+        working-directory: services/core
+        env:
+          LAWBUDDY_MODEL_API_KEY: ${{ secrets.LAWBUDDY_MODEL_API_KEY }}
+          WFA_LAW_DATA: ${{ vars.WFA_LAW_DATA }}
+        run: |
+          python -m evals.wfa_law --profile full --data-dir "$WFA_LAW_DATA" \
+            --collect-harness-metrics --runtime v2 --out law-full.json
+
+      - name: 下载上一期结果
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: law-full-result
+          path: previous
+
+      - name: 与上一期对比（回归 diff）
+        working-directory: services/core
+        run: |
+          if [ -f previous/law-full.json ]; then
+            python -m evals.wfa_law --compare previous/law-full.json law-full.json \
+              | tee law-full-compare.json
+          else
+            echo "无上一期结果，本次作为基线"
+          fi
+
+      - name: 上传全量结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: law-full-result
+          path: |
+            services/core/law-full.json
+            services/core/law-full-compare.json
+          if-no-files-found: warn
 
   secret-scan:
     name: 密钥扫描门禁

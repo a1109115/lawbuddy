@@ -35,9 +35,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-# 与实现保持一致的分页上限（评测断言的是协议行为，不硬编码具体数值时从此处读取）
-PAGE_TEXT_LIMIT = 2400
-TOTAL_PAGE_READ_CHARS = 6000
+# 分页上限以实现为准（评测断言的是协议行为，不硬编码数值）
+from lawbuddy.agent.autonomous import (  # noqa: E402
+    PAGE_TEXT_LIMIT as PAGE_TEXT_LIMIT,
+    TOTAL_PAGE_READ_CHARS as TOTAL_PAGE_READ_CHARS,
+)
 
 
 def _seg(report: dict[str, Any], name: str, fn, *args) -> bool:
@@ -364,8 +366,11 @@ def _run_pagination(report: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]
     from lawbuddy.agent.autonomous import PAGE_TEXT_LIMIT, _paginate_pages
 
     rows: list[dict[str, Any]] = []
+    # 长页必须超过单次回灌上限才会触发续读，这里按实现上限放大语料，
+    # 避免评测把「上限提高后一页能一次读完」误判为续读失效。
+    repeat = max(120, PAGE_TEXT_LIMIT // 40 + 40)
     long_text = ("第一段：双方确认借款金额为人民币二十万元整。\n"
-                 "第二段：还款期限为二〇二五年十二月三十一日。\n") * 120
+                 "第二段：还款期限为二〇二五年十二月三十一日。\n") * repeat
     pages = [
         {"pageNo": 1, "text": long_text, "quality": "native", "printedPage": "1"},
         {"pageNo": 2, "text": "第二页：担保人张伟承担连带保证责任。", "quality": "native", "printedPage": "2"},

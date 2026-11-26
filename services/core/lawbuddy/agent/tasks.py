@@ -77,6 +77,7 @@ def create_task(
     skills: list[str] | None = None,
     history: list[dict[str, Any]] | None = None,
     conversation_id: str | None = None,
+    deliverables: Any = None,
 ) -> dict[str, Any]:
     db = get_db()
     request_text = (request_text or "").strip()
@@ -106,13 +107,24 @@ def create_task(
 
     task_id = str(uuid.uuid4())
     ts = now_iso()
+    # 交付契约（P0-04）：显式声明优先；未声明时从请求里点名的输出文件名推导，
+    # 使「请输出 deal_points.csv」这类任务也能先落骨架。规范化失败不阻断建任务。
+    try:
+        from . import deliverables as deliverable_store
+
+        deliverable_specs = deliverable_store.normalize_specs(deliverables)
+        if not deliverable_specs:
+            deliverable_specs = deliverable_store.derive_from_request(request_text)
+    except Exception:
+        deliverable_specs = []
     with db.transaction() as conn:
         conn.execute(
             """
             INSERT INTO tasks(id, case_id, mode, lifecycle, stage, request_text, workflow_preset,
                               selected_document_ids_json, client_position_json, skills_json, history_json,
-                              model_policy_json, tool_policy_json, budget_json, conversation_id, created_at, updated_at)
-            VALUES (?, ?, ?, 'CREATED', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              model_policy_json, tool_policy_json, budget_json, deliverables_json,
+                              conversation_id, created_at, updated_at)
+            VALUES (?, ?, ?, 'CREATED', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id, case_id, mode, request_text, workflow_preset,
@@ -123,6 +135,7 @@ def create_task(
                 json.dumps(model_policy or {}, ensure_ascii=False),
                 json.dumps(tool_policy or {}, ensure_ascii=False),
                 json.dumps(budget or {}, ensure_ascii=False),
+                json.dumps(deliverable_specs, ensure_ascii=False),
                 conversation_id,
                 ts, ts,
             ),
@@ -135,7 +148,11 @@ def create_task(
             resource_type="task",
             resource_id=task_id,
             case_id=case_id,
-            metadata={"mode": mode, "requestLen": len(request_text), "workflowPreset": workflow_preset},
+            metadata={
+                "mode": mode, "requestLen": len(request_text), "workflowPreset": workflow_preset,
+                # 只记交付物文件名与格式，不写内容
+                "deliverables": [s.get("name") for s in deliverable_specs],
+            },
         )
     append_event(task_id, "status", {"lifecycle": "CREATED"})
     return get_task(task_id)
@@ -168,9 +185,60 @@ def get_task(task_id: str) -> dict[str, Any]:
         "conversationId": row["conversation_id"] if "conversation_id" in row.keys() else None,
         # DEV-AGT-006：任务级预算覆盖（缺省用系统默认上限）
         "budget": json.loads(row["budget_json"] or "{}") if "budget_json" in row.keys() else {},
+        # 交付契约（P0-04）：任务声明的交付物（空 = 不启用交付骨架）
+        "deliverables": json.loads(row["deliverables_json"] or "[]")
+        if "deliverables_json" in row.keys() else [],
         "createdAt": row["created_at"],
         "finishedAt": row["finished_at"],
+        # 运行状态与进度（B-05）：数值直接取自工作账本与预算表，
+        # 不从前端缓存或模型文本推断；账本未启用时返回空值
+        **_progress_fields(task_id),
     }
+
+
+def _progress_fields(task_id: str) -> dict[str, Any]:
+    """聚合运行时版本、交付状态、工作进度与预算进度（失败降级为空）。"""
+    out: dict[str, Any] = {
+        "runtimeVersion": None,
+        "deliveryStatus": None,
+        "workProgress": None,
+        "budgetProgress": None,
+    }
+    try:
+        from . import scheduler, work_ledger
+
+        runtime = work_ledger.get_runtime(task_id)
+        if runtime:
+            out["runtimeVersion"] = runtime.get("runtimeVersion")
+        progress = scheduler.progress(task_id)
+        out["workProgress"] = progress
+        out["deliveryStatus"] = (progress.get("delivery") or {}).get("status")
+    except Exception:  # noqa: BLE001 账本读取失败不影响任务信息本身
+        pass
+    try:
+        from . import budget
+
+        snap = budget.snapshot(task_id)
+        limits = snap.get("limits") or {}
+        # 交付保留轮次与主循环同一拆分口径（B-03 §4.5）
+        reserved = 0
+        try:
+            from . import scheduler
+
+            reserved = scheduler.split_budget(int(limits.get("maxRounds") or 0))[
+                "deliveryReservedRounds"]
+        except Exception:  # noqa: BLE001
+            reserved = 0
+        out["budgetProgress"] = {
+            "stage": snap.get("stage"),
+            "limits": limits,
+            "used": budget.public_used(snap.get("used")),
+            "reasons": snap.get("reasons") or [],
+            "deliveryReservedRounds": reserved,
+        }
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def list_active_tasks(case_id: str, exclude_task_id: str | None = None) -> list[dict[str, Any]]:

@@ -35,8 +35,8 @@ class ScriptStep:
     """
 
     def __init__(self, kind: str, payload: Any) -> None:
-        self.kind = kind        # "tool" | "final" | "tool_text"
-        self.payload = payload  # (name, args) 或 text 或 (name, args, text)
+        self.kind = kind        # "tool" | "final" | "tool_text" | "interrupt"
+        self.payload = payload  # (name, args) 或 text 或 (name, args, text) 或 (部分正文, 可续写?)
 
     @classmethod
     def tool(cls, name: str, arguments: Any) -> "ScriptStep":
@@ -50,6 +50,15 @@ class ScriptStep:
     def tool_with_text(cls, name: str, arguments: Any, text: Any) -> "ScriptStep":
         """同一轮既输出过程说明文本、又发起工具调用（§7.3 最后一条的边界场景）。"""
         return cls("tool_text", (name, arguments, text))
+
+    @classmethod
+    def interrupt(cls, partial: str, *, resumable: bool = True) -> "ScriptStep":
+        """模拟长输出中途断连（P2-10）：已生成 partial，抛 StreamInterrupted。
+
+        resumable=True 模拟"已收到正文且无工具调用"的中途断连，Loop 应带着
+        partial 请求续写；False 模拟首字前断连，应直接上抛交由传输层重试。
+        """
+        return cls("interrupt", (partial, resumable))
 
 
 def user_payload(messages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -133,6 +142,16 @@ def install_mock_gateway(steps: list[ScriptStep]) -> Callable[[], None]:
         efforts.append(record)
         LAST_EFFORTS.append(record)
         usage = {"promptTokens": 100, "completionTokens": 40}
+
+        if idx < len(script) and script[idx].kind == "interrupt":
+            # P2-10 断连注入：模拟流式响应中途断开，交给真实 Loop 处理续写
+            partial, resumable = script[idx].payload
+            text = str(_resolve(partial, messages))
+            if on_text_delta is not None and text:
+                on_text_delta(text)
+            raise model_gateway.StreamInterrupted(
+                text, "RemoteDisconnected", resumable=bool(resumable),
+            )
 
         if idx < len(script) and script[idx].kind == "tool":
             name, args = script[idx].payload

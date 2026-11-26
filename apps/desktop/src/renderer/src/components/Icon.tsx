@@ -234,6 +234,12 @@ const SPRITE: Record<string, JSX.Element> = {
       <circle cx="16" cy="16" r="2.6" stroke="currentColor" strokeWidth="1.8" fill="none" />
     </>
   ),
+  'i-toggle': (
+    <>
+      <rect x="3" y="7.5" width="18" height="9" rx="4.5" stroke="currentColor" strokeWidth="1.8" fill="none" />
+      <circle cx="16" cy="12" r="2.4" stroke="currentColor" strokeWidth="1.8" fill="none" />
+    </>
+  ),
   'i-square': <rect x="5.5" y="5.5" width="13" height="13" rx="1.5" stroke="currentColor" strokeWidth="1.8" fill="none" />,
   'i-x': <path d="M18 6 6 18M6 6l12 12" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" />,
   'i-check': <path d="M20 6 9 17l-5-5" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" fill="none" />,

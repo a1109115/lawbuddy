@@ -1,0 +1,117 @@
+{
+  "profile": "fast",
+  "fixtures": [
+    "wfa-law-mini",
+    "wfa-law-criminal"
+  ],
+  "checks": [
+    {
+      "name": "wfa-law-mini.goldScoresPerfect",
+      "ok": true,
+      "branch": 1.0,
+      "merge": 1.0
+    },
+    {
+      "name": "wfa-law-mini.emptyScoresZero",
+      "ok": true
+    },
+    {
+      "name": "wfa-law-mini.partialIsDeterministic",
+      "ok": true,
+      "branch": 0.8889
+    },
+    {
+      "name": "wfa-law-mini.scoringIsStable",
+      "ok": true
+    },
+    {
+      "name": "wfa-law-mini.matchesOfficialVerifier",
+      "ok": true,
+      "officialBranch": 0.8889,
+      "ourBranch": 0.8889
+    },
+    {
+      "name": "wfa-law-criminal.goldScoresPerfect",
+      "ok": true,
+      "branch": 1.0,
+      "merge": 1.0
+    },
+    {
+      "name": "wfa-law-criminal.emptyScoresZero",
+      "ok": true
+    },
+    {
+      "name": "wfa-law-criminal.partialIsDeterministic",
+      "ok": true,
+      "branch": 0.9167
+    },
+    {
+      "name": "wfa-law-criminal.scoringIsStable",
+      "ok": true
+    },
+    {
+      "name": "wfa-law-criminal.matchesOfficialVerifier",
+      "ok": true,
+      "officialBranch": 0.9167,
+      "ourBranch": 0.9167
+    },
+    {
+      "name": "aggregateOperatorsMatch",
+      "ok": true,
+      "mismatch": 0,
+      "detail": {}
+    },
+    {
+      "name": "criminal.batchedIntoThree",
+      "ok": true,
+      "batches": [
+        {
+          "index": 1,
+          "start": 1,
+          "end": 4,
+          "count": 4
+        },
+        {
+          "index": 2,
+          "start": 5,
+          "end": 8,
+          "count": 4
+        },
+        {
+          "index": 3,
+          "start": 9,
+          "end": 12,
+          "count": 4
+        }
+      ]
+    },
+    {
+      "name": "criminal.mergeKeepsAllEntities",
+      "ok": true,
+      "keys": [
+        "D01",
+        "D02",
+        "D03",
+        "D04",
+        "D05",
+        "D06",
+        "D07",
+        "D08",
+        "D09",
+        "D10",
+        "D11",
+        "D12"
+      ]
+    },
+    {
+      "name": "criminal.mergedPassesValidation",
+      "ok": true,
+      "issues": []
+    },
+    {
+      "name": "criminal.missingBatchReported",
+      "ok": true
+    }
+  ],
+  "ok": true
+}

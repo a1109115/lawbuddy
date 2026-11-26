@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LawBuddy 法律任务实测报告（2026-11-12 复测）</title>
+<style>
+  :root{
+    --ink:#15181d; --ink2:#3f4753; --ink3:#78828f; --line:#e4e7ec;
+    --bg:#fbfbfa; --card:#fff; --blue:#1f4e79; --blue2:#3a7ca5;
+    --green:#2a6f5e; --red:#a8382d; --amber:#9a6517; --violet:#5b4a8a;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:"PingFang SC","Microsoft YaHei","Segoe UI",system-ui,sans-serif;
+    font-size:15.5px; line-height:1.75; -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1000px;margin:0 auto;padding:56px 32px 100px}
+  header{border-bottom:3px solid var(--ink);padding-bottom:22px;margin-bottom:36px}
+  .kicker{font-size:11.5px;letter-spacing:.16em;color:var(--ink3);margin-bottom:12px;font-weight:700}
+  h1{font-size:31px;line-height:1.28;margin:0 0 14px;letter-spacing:-.01em}
+  .lead{font-size:16.5px;color:var(--ink2);margin:0}
+  .meta{display:flex;flex-wrap:wrap;gap:8px 22px;margin-top:18px;font-size:13px;color:var(--ink3)}
+  .meta b{color:var(--ink2);font-weight:650}
+  h2{font-size:20px;margin:52px 0 16px;padding-top:14px;border-top:1px solid var(--line)}
+  h2 .n{color:var(--blue);margin-right:9px;font-variant-numeric:tabular-nums}
+  h3{font-size:16.5px;margin:28px 0 10px}
+  p{margin:0 0 14px}
+  ul,ol{margin:0 0 16px;padding-left:22px}
+  li{margin-bottom:8px}
+  .hero{background:var(--card);border:1px solid var(--line);border-left:5px solid var(--blue);
+        padding:24px 26px;margin-bottom:28px;border-radius:0 8px 8px 0}
+  .hero h3{margin:0 0 8px}
+  .hero .big{font-size:18.5px;font-weight:700;line-height:1.5;margin:0 0 14px}
+  .hero p{margin-bottom:9px;color:var(--ink2)}
+  .hero p:last-child{margin-bottom:0}
+  table{width:100%;border-collapse:collapse;margin:16px 0 22px;font-size:14px;background:var(--card)}
+  .tscroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line)}
+  th{background:#f2f4f7;font-weight:650;font-size:12.5px;color:var(--ink2);white-space:nowrap}
+  td.n,th.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+  tr:last-child td{border-bottom:none}
+  tr.total td{background:#f7f8fa;font-weight:700}
+  .tag{display:inline-block;font-size:11.5px;padding:2px 8px;border-radius:10px;font-weight:650;white-space:nowrap}
+  .t-red{background:#fbeae7;color:var(--red)}
+  .t-green{background:#e6f1ee;color:var(--green)}
+  .t-amber{background:#fbf2e2;color:var(--amber)}
+  .t-gray{background:#eef1f4;color:var(--ink2)}
+  .t-blue{background:#e8f0f6;color:var(--blue)}
+  .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:20px 0 26px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:18px}
+  .card .h{font-size:11.5px;font-weight:700;letter-spacing:.06em;color:var(--ink3);margin-bottom:9px}
+  .card .v{font-size:25px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.15}
+  .card .d{font-size:12.5px;color:var(--ink2);margin-top:7px;line-height:1.6}
+  .note{background:#f4f7f9;border:1px solid #d9e3ea;border-radius:8px;padding:18px 22px;margin:20px 0}
+  .note.warn{background:#fdf8f1;border-color:#ecdfc8}
+  .note.stop{background:#fdf3f2;border-color:#efd9d5}
+  .note .lbl{font-size:11px;font-weight:700;letter-spacing:.1em;color:var(--ink3);margin-bottom:8px}
+  .note p:last-child{margin-bottom:0}
+  .chart{background:var(--card);border:1px solid var(--line);border-radius:9px;padding:20px 22px 14px;margin:20px 0 24px}
+  .chart-title{font-size:13px;font-weight:700;color:var(--ink2);margin-bottom:4px}
+  .chart-sub{font-size:12px;color:var(--ink3);margin-bottom:16px}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;font-size:12px;color:var(--ink2);margin-top:12px}
+  .legend i{display:inline-block;width:11px;height:11px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+  svg{display:block;width:100%;height:auto;overflow:visible}
+  .bar-lbl{font-size:12.5px;fill:var(--ink2)}
+  .bar-val{font-size:12px;font-weight:700;fill:var(--ink2);font-variant-numeric:tabular-nums}
+  .axis{font-size:11px;fill:var(--ink3)}
+  .grid{stroke:#eceff3;stroke-width:1}
+  .goal{stroke:var(--green);stroke-width:1.6;stroke-dasharray:4 3;opacity:.85}
+  footer{margin-top:64px;padding-top:20px;border-top:1px solid var(--line);font-size:12.5px;color:var(--ink3)}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:8px 26px}
+  @media(max-width:760px){
+    .wrap{padding:32px 16px 70px}
+    h1{font-size:22px}
+    .cards{grid-template-columns:1fr}
+    .two{grid-template-columns:1fr}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="kicker">评测报告 · 第二轮复测</div>
+  <h1>修完之后，LawBuddy 的法律活到底做到了什么程度</h1>
+  <p class="lead">用 WorkflowArena 公开的 22 道法律任务，对修复后的 LawBuddy 重新完整跑一遍。分数由出题方官方评分程序产出，本轮没有为了分数改任何产品代码。</p>
+  <div class="meta">
+    <span><b>被测产品</b> LawBuddy</span>
+    <span><b>使用模型</b> deepseek-v4.1-flash</span>
+    <span><b>题量</b> 22 道（合同 13 + 刑事 9）</span>
+    <span><b>复测日期</b> 2026-11-12</span>
+    <span><b>上一轮</b> 2026-11-11</span>
+  </div>
+</header>
+
+<div class="hero">
+  <h3>先说结论</h3>
+  <p class="big">批量评测平均 31.6 分，比上一轮的 30.3 分只提高 1.3 分。22 道题里 11 道变好、10 道变差、1 道持平，按官方门槛 0 道通过。</p>
+  <p>但本轮真正的发现不在这 22 道题里。同一道合同题，批量链路拿 28.3 分，交给产品自己的自主 Agent 却拿到 <b>87.4 分并完全通过</b>；刑事题从 70.8 分提到 <b>83.1 分</b>。而另一道更复杂的合同题，自主 Agent 跑满 900 轮也没做完，<b>0 分</b>。</p>
+  <p>所以结论是：<b>LawBuddy 的能力上限已经能通过官方考题，但稳定性不足</b>——材料规整时表现优秀，材料一复杂就做不完。这个结论和上一轮"平均 40 分、离及格很远"的判断不一样，必须更正。</p>
+</div>
+
+<h2><span class="n">01</span>这次考的是什么</h2>
+
+<p>WorkflowArena 是一套公开的 AI 工作能力测试。法律部分 22 道题，对应律所里两类真实活：</p>
+
+<div class="tscroll"><table>
+  <thead><tr><th style="width:20%">类型</th><th class="n" style="width:10%">数量</th><th>在考什么</th><th style="width:16%">通过门槛</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><b>合同比对</b></td><td class="n">13 道</td>
+      <td>给 12–20 份英文并购合同（每份 50–190 页），逐份回答 15–22 个标准化问题（如"重大不利变化条款排除了哪些情形"），再做跨合同横向统计。本质是把一摞合同整理成一张对照表。</td>
+      <td><span class="tag t-gray">逐份 ≥ 90%<br>汇总 ≥ 75%</span></td>
+    </tr>
+    <tr>
+      <td><b>刑事研判</b></td><td class="n">9 道</td>
+      <td>给一份真实案件证据摘录（1 万–24 万字）和 47 份法律条文库，为 8–18 名被告分别判定罪名、法条、主从犯、量刑情节和刑期。</td>
+      <td><span class="tag t-gray">多项指标<br>均 ≥ 80%</span></td>
+    </tr>
+  </tbody>
+</table></div>
+
+<p>评分完全用出题方的官方程序（<code>verify.py</code>）计算，我们不参与打分、不调分。每个任务的输入、输出和评分脚本都保留在本地，可复查。</p>
+
+<div class="note">
+  <div class="lbl">题目规模</div>
+  <div class="two">
+    <div>合同类合计 <b>3,408 个待填格子</b>（如第 1 题 16 份 × 18 题 = 288 格）</div>
+    <div>刑事类合计 <b>109 名被告</b>，最多一题 18 人</div>
+    <div>合同类材料约 <b>1,600–2,800 页</b></div>
+    <div>刑事类证据最长 <b>24.5 万字</b>（第 14 题）</div>
+  </div>
+</div>
+
+<h2><span class="n">02</span>成绩单</h2>
+
+<h3>三类指标的整体水平</h3>
+
+<div class="cards">
+  <div class="card">
+    <div class="h">合同比对（13 道）</div>
+    <div class="v">22.2<span style="font-size:15px;font-weight:400"> 分</span></div>
+    <div class="d">逐份答题 34.8 分<br>横向汇总 9.6 分</div>
+  </div>
+  <div class="card">
+    <div class="h">刑事研判（9 道）</div>
+    <div class="v">45.1<span style="font-size:15px;font-weight:400"> 分</span></div>
+    <div class="d">单项指标 49.6 分<br>综合判定 40.7 分</div>
+  </div>
+  <div class="card">
+    <div class="h">完全通过</div>
+    <div class="v" style="color:var(--red)">0<span style="font-size:15px;font-weight:400"> / 22</span></div>
+    <div class="d">最高分第 19 题 70.8 分<br>最低分第 13 题 8.2 分</div>
+  </div>
+</div>
+
+<h3>逐题得分：合同类</h3>
+
+<div class="chart">
+  <div class="chart-title">合同比对 13 道题（WFA-LAW-001 ~ 013）</div>
+  <div class="chart-sub">柱长为综合得分（逐份答题与横向汇总的均值），虚线为出题方设定的 90 分合格线</div>
+  <svg viewBox="0 0 900 330" role="img" aria-label="合同类逐题得分柱状图">
+    <g class="axis">
+      <text x="56" y="12">90</text><line class="grid" x1="70" y1="8" x2="860" y2="8"/>
+      <text x="56" y="56">75</text><line class="grid" x1="70" y1="52" x2="860" y2="52"/>
+      <text x="56" y="100">60</text><line class="grid" x1="70" y1="96" x2="860" y2="96"/>
+      <text x="56" y="144">45</text><line class="grid" x1="70" y1="140" x2="860" y2="140"/>
+      <text x="56" y="188">30</text><line class="grid" x1="70" y1="184" x2="860" y2="184"/>
+      <text x="56" y="232">15</text><line class="grid" x1="70" y1="228" x2="860" y2="228"/>
+      <text x="56" y="276">0</text><line class="grid" x1="70" y1="272" x2="860" y2="272"/>
+    </g>
+    <line class="goal" x1="70" y1="8" x2="860" y2="8"/>
+    <g id="c-bars"></g>
+  </svg>
+  <div class="legend"><span><i style="background:#3a7ca5"></i>综合得分</span><span><i style="background:var(--green);opacity:.8"></i>90 分合格线</span></div>
+</div>
+
+<h3>逐题得分：刑事类</h3>
+
+<div class="chart">
+  <div class="chart-title">刑事研判 9 道题（WFA-LAW-014 ~ 022）</div>
+  <div class="chart-sub">柱长为综合得分，标注为参与判定的被告人数（灰色为未判出的人数）</div>
+  <svg viewBox="0 0 900 320" role="img" aria-label="刑事类逐题得分柱状图">
+    <g class="axis">
+      <text x="56" y="12">90</text><line class="grid" x1="70" y1="8" x2="860" y2="8"/>
+      <text x="56" y="56">75</text><line class="grid" x1="70" y1="52" x2="860" y2="52"/>
+      <text x="56" y="100">60</text><line class="grid" x1="70" y1="96" x2="860" y2="96"/>
+      <text x="56" y="144">45</text><line class="grid" x1="70" y1="140" x2="860" y2="140"/>
+      <text x="56" y="188">30</text><line class="grid" x1="70" y1="184" x2="860" y2="184"/>
+      <text x="56" y="232">15</text><line class="grid" x1="70" y1="228" x2="860" y2="228"/>
+      <text x="56" y="276">0</text><line class="grid" x1="70" y1="272" x2="860" y2="272"/>
+    </g>
+    <line class="goal" x1="70" y1="8" x2="860" y2="8"/>
+    <g id="m-bars"></g>
+  </svg>
+  <div class="legend"><span><i style="background:#5b4a8a"></i>综合得分</span><span><i style="background:var(--green);opacity:.8"></i>90 分合格线</span></div>
+</div>
+
+<h3>逐题明细</h3>
+
+<div class="tscroll"><table>
+  <thead><tr><th>题目</th><th>类型</th><th class="n">逐份/单项</th><th class="n">汇总/综合</th><th class="n">综合得分</th><th class="n">上一轮</th><th class="n">变化</th></tr></thead>
+  <tbody id="detail-rows"></tbody>
+</table></div>
+
+<div class="note">
+  <div class="lbl">怎么读这张表</div>
+  <p>合同类的"综合得分"= (逐份答题 + 横向汇总) ÷ 2，这是出题方 paper score 的口径。刑事类同理。所以一道题即使逐份答对 49%，只要汇总题全错，综合分也只有 30 分左右——<b>汇总题是当前最大的失分点</b>。</p>
+</div>
+
+<h2><span class="n">03</span>和上一轮比，到底有没有改善</h2>
+
+<p>上一轮总平均 30.3 分，这一轮 31.6 分。单看总分像是"几乎没动"，但拆开看不是一回事：</p>
+
+<div class="chart">
+  <div class="chart-title">两轮对比：每个任务的变化</div>
+  <div class="chart-sub">绿色为提升，红色为下降；纵轴为综合得分变化量（百分点）</div>
+  <svg viewBox="0 0 900 300" role="img" aria-label="两轮逐题变化对比图">
+    <line class="grid" x1="70" y1="120" x2="860" y2="120" stroke="#9aa4b0"/>
+    <text x="860" y="112" text-anchor="end" class="axis">基准线（本轮=上轮）</text>
+    <g id="delta-bars"></g>
+  </svg>
+  <div class="legend"><span><i style="background:#2a6f5e"></i>本轮更好</span><span><i style="background:#a8382d"></i>本轮更差</span></div>
+</div>
+
+<div class="tscroll"><table>
+  <thead><tr><th>分组</th><th class="n">上一轮</th><th class="n">本轮</th><th class="n">变化</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>合同 · 逐份答题</td><td class="n">35.6</td><td class="n">34.8</td><td class="n"><span class="tag t-red">−0.8</span></td><td>基本持平，略有下降</td></tr>
+    <tr><td>合同 · 横向汇总</td><td class="n">7.4</td><td class="n">9.6</td><td class="n"><span class="tag t-green">+2.2</span></td><td>仍是全盘最弱项</td></tr>
+    <tr><td>刑事 · 单项指标</td><td class="n">46.1</td><td class="n">49.6</td><td class="n"><span class="tag t-green">+3.5</span></td><td>罪名/法条判定小幅改善</td></tr>
+    <tr><td>刑事 · 综合判定</td><td class="n">40.0</td><td class="n">40.7</td><td class="n"><span class="tag t-gray">+0.7</span></td><td>主从犯与情节判定几乎未动</td></tr>
+    <tr class="total"><td>全部 22 题</td><td class="n">30.3</td><td class="n">31.6</td><td class="n">+1.3</td><td>11 题改善 / 10 题退步 / 1 题持平</td></tr>
+  </tbody>
+</table></div>
+
+<div class="note warn">
+  <div class="lbl">必须说清楚的一点</div>
+  <p>11 题变好、10 题变差，说明<b>总分上这 1.3 分的提升在统计上接近噪声</b>。真正稳定、可解释的改善只有两处：刑事类第 16 题（+18.2 分，角色判定准确率 91.7%）、第 17 题（+8.0 分）；合同类第 10 题（+9.5 分）、第 4 题（+8.5 分）。</p>
+  <p>反过来，退步最明显的是合同第 7 题（−9.9 分）和刑事第 20 题（−9.9 分）。第 20 题的原因是模型在同一次任务里多次断连、部分批次没拿到答案；<b>第 7 题没有任何断连记录</b>，两次运行的检索命中页不同就足以让 15 份合同里 1 份、共 16 个格子从得分变成零分（它的覆盖率仅 30.4%）——这类题的单次得分波动本就很大，不能当成"产品退步"。</p>
+</div>
+
+<h2><span class="n">04</span>失分到底失在哪：三个可量化的证据</h2>
+
+<h3>证据一：填表覆盖率与得分几乎完全相关</h3>
+
+<p>把合同类每道题的"实际填了多少格"和"得分"放在一起看：</p>
+
+<div class="chart">
+  <div class="chart-title">答题覆盖率 vs 得分（合同类 13 题）</div>
+  <div class="chart-sub">横轴为已填写格子占比，纵轴为逐份答题得分；相关系数 r = 0.97</div>
+  <svg viewBox="0 0 900 300" role="img" aria-label="覆盖率与得分散点图">
+    <g class="axis" id="scatter-axis"></g>
+    <g id="scatter"></g>
+  </svg>
+  <div class="legend"><span><i style="background:#3a7ca5"></i>单个任务；点旁数字为题目编号</span></div>
+</div>
+
+<p>覆盖率从 20% 到 58%，得分从 16 分到 49 分，<b>几乎是一条直线（r = 0.97）</b>。这直接说明：合同类的分数瓶颈不在"法律判断对不对"，而在"有没有把材料读全、把格子填上"。第 8 题覆盖率只有 19.9%，得分 16.3；第 12 题覆盖率 58.3%，得分 48.8。全部 13 题平均只填了 <b>43.3%</b> 的格子。</p>
+
+<h3>证据二：部分协议整份拿零分</h3>
+
+<p>13 道合同题里有 8 道存在"整份合同所有格子全错"的情况，合计 <b>31 份合同全零</b>（占 208 份材料的 15%）：</p>
+
+<div class="tscroll"><table>
+  <thead><tr><th>题目</th><th class="n">协议数</th><th class="n">零分协议</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>WFA-LAW-012</td><td class="n">20</td><td class="n"><span class="tag t-red">8 份</span></td><td>40% 的合同完全没有拿到分</td></tr>
+    <tr><td>WFA-LAW-002</td><td class="n">15</td><td class="n"><span class="tag t-red">6 份</span></td><td>另有 4 份得分低于 0.2</td></tr>
+    <tr><td>WFA-LAW-001</td><td class="n">16</td><td class="n"><span class="tag t-red">5 份</span></td><td>A03 / A08 / A10 / A11 / A16</td></tr>
+    <tr><td>WFA-LAW-013</td><td class="n">20</td><td class="n"><span class="tag t-red">5 份</span></td><td>该题本身得分也最低（8.2 分）</td></tr>
+    <tr><td>WFA-LAW-003</td><td class="n">18</td><td class="n"><span class="tag t-amber">4 份</span></td><td>—</td></tr>
+    <tr><td>006 / 007 / 010</td><td class="n">43</td><td class="n"><span class="tag t-amber">各 1 份</span></td><td>合计 3 份</td></tr>
+  </tbody>
+</table></div>
+
+<p>一份合同全零，通常只有一个原因：<b>没有检索到它的条款定义页</b>。这些合同往往把 "Material Adverse Effect" 定义写在几十页之后的附件或特殊章节里，通用检索词命中的是正文里引用它的句子，而不是定义本身。</p>
+
+<h3>证据三：汇总题几乎全错，尽管表内一致性是满分</h3>
+
+<p>出题方同时给两个汇总指标：严格的"精确匹配"和宽松的"部分分"。本轮 13 道合同题的精确匹配平均 9.6 分，部分分平均 <b>24.2 分</b>，一致性检查全部为 1.0（说明我们的答案是"机械自洽"地算出来的，不是乱填）。</p>
+
+<div class="chart">
+  <div class="chart-title">横向汇总题：精确匹配 vs 部分分</div>
+  <div class="chart-sub">逐题对比，灰色为精确匹配（计分用），蓝色为部分分（不计分，仅用来看差距来源）</div>
+  <svg viewBox="0 0 900 300" role="img" aria-label="汇总题精确匹配与部分分对比">
+    <g class="axis">
+      <text x="56" y="12">60</text><line class="grid" x1="70" y1="8" x2="860" y2="8"/>
+      <text x="56" y="64">45</text><line class="grid" x1="70" y1="60" x2="860" y2="60"/>
+      <text x="56" y="116">30</text><line class="grid" x1="70" y1="112" x2="860" y2="112"/>
+      <text x="56" y="168">15</text><line class="grid" x1="70" y1="164" x2="860" y2="164"/>
+      <text x="56" y="220">0</text><line class="grid" x1="70" y1="216" x2="860" y2="216"/>
+    </g>
+    <g id="merge-bars"></g>
+  </svg>
+  <div class="legend"><span><i style="background:#8d99a6"></i>精确匹配（计分口径）</span><span><i style="background:#3a7ca5"></i>部分分（仅参考）</span></div>
+</div>
+
+<p>精确匹配和部分分差距 2–4 倍，说明汇总题的逻辑方向基本对了，但<b>只要前面有一格填错，整道题的答案就偏了</b>。这是"逐份准确率不够高"向"汇总题"的放大结果，不是汇总算法本身的问题。</p>
+
+<h2><span class="n">05</span>刑事类：结构清晰时能做到很好</h2>
+
+<p>刑事类 9 道题平均 45.1 分，明显高于合同类。更重要的是内部分化极大，而这个分化能说清楚原因：</p>
+
+<div class="tscroll"><table>
+  <thead><tr><th>题目</th><th class="n">被告</th><th class="n">判出</th><th class="n">单项</th><th class="n">综合</th><th class="n">角色准确率</th><th>判断</th></tr></thead>
+  <tbody>
+    <tr><td>WFA-LAW-019</td><td class="n">13</td><td class="n">13</td><td class="n">54.9</td><td class="n">86.7</td><td class="n"><b>100%</b></td><td><span class="tag t-green">13 人全部判对</span></td></tr>
+    <tr><td>WFA-LAW-016</td><td class="n">12</td><td class="n">12</td><td class="n">71.3</td><td class="n">61.7</td><td class="n">91.7%</td><td><span class="tag t-green">接近可用</span></td></tr>
+    <tr><td>WFA-LAW-017</td><td class="n">15</td><td class="n">11</td><td class="n">66.7</td><td class="n">54.7</td><td class="n">46.7%</td><td><span class="tag t-amber">漏判 4 人</span></td></tr>
+    <tr><td>WFA-LAW-021</td><td class="n">14</td><td class="n">14</td><td class="n">64.8</td><td class="n">32.4</td><td class="n">42.9%</td><td><span class="tag t-amber">主从犯判断弱</span></td></tr>
+    <tr><td>WFA-LAW-015</td><td class="n">18</td><td class="n">18</td><td class="n">47.8</td><td class="n">26.7</td><td class="n">33.3%</td><td><span class="tag t-amber">被告人多，质量下降</span></td></tr>
+    <tr><td>WFA-LAW-022</td><td class="n">9</td><td class="n">9</td><td class="n">36.3</td><td class="n">35.2</td><td class="n">36.4%</td><td><span class="tag t-gray">中等</span></td></tr>
+    <tr><td>WFA-LAW-014</td><td class="n">8</td><td class="n">8</td><td class="n">37.5</td><td class="n">20.8</td><td class="n">12.5%</td><td><span class="tag t-red">24 万字证据读不全</span></td></tr>
+    <tr><td>WFA-LAW-018</td><td class="n">9</td><td class="n">5</td><td class="n">39.7</td><td class="n">16.7</td><td class="n">16.7%</td><td><span class="tag t-red">漏判 4 人</span></td></tr>
+    <tr><td>WFA-LAW-020</td><td class="n">11</td><td class="n">7</td><td class="n">27.3</td><td class="n">31.7</td><td class="n">8.3%</td><td><span class="tag t-red">漏判 4 人</span></td></tr>
+  </tbody>
+</table></div>
+
+<div class="note">
+  <div class="lbl">这张表最值得注意的两行</div>
+  <p><b>第 19 题</b>：13 名被告，角色判定 100% 正确，综合 86.7 分——这是全榜最高分，也证明当证据结构清晰、被告数量适中时，产品能做出接近人工作业的判决书。</p>
+  <p><b>第 14 题</b>：24.5 万字证据、8 名被告，8 人全部判出，但角色准确率只有 12.5%。这是"读到了但读得不深"的典型——证据量超过阅读预算后，模型只能抓大意，细节判断系统性出错。</p>
+</div>
+
+<h3>被告数量与完成度</h3>
+
+<p>把"判出的被告数 ÷ 应判被告数"按人数排一下，规律很清晰：</p>
+
+<div class="chart">
+  <div class="chart-title">应判被告人数 vs 实际判出比例</div>
+  <div class="chart-sub">灰点为应判人数，蓝条为实际判出的比例；未达 100% 表示有被告被漏判</div>
+  <svg viewBox="0 0 900 270" role="img" aria-label="被告数量与完成度">
+    <g id="def-bars"></g>
+  </svg>
+  <div class="legend"><span><i style="background:#3a7ca5"></i>判出比例</span><span><i style="background:#c9d2db"></i>漏判</span></div>
+</div>
+
+<p>这里没有简单的"人越多越差"规律：18 人的第 15 题全部判出，15 人的第 17 题反而漏了 4 人。真正的分界是<b>证据里各被告的被提及密度</b>——被漏的几乎都是证据中出现次数少、只被同案犯口供带到一两句的从犯，而不是人数本身。</p>
+
+<h2><span class="n">06</span>产品自身的端到端表现：本轮最重要的发现</h2>
+
+<p>前面 22 道题走的是"产品检索 + 模型判定"的<b>半自动链路</b>（我们替产品决定检索路由、限定单份文档、拼接命中页）。这个链路方便批量测，但它不是用户真实使用时的方式。</p>
+
+<p>所以另起一组测试：把任务原文和全部材料交给 LawBuddy 的<b>自主 Agent</b>，让它自己规划、自己检索、自己决定怎么读、自己写交付物，全程不做人工干预。只用官方 <code>verify.py</code> 打分。</p>
+
+<div class="cards">
+  <div class="card">
+    <div class="h">合同类 · 第 1 题（自主）</div>
+    <div class="v" style="color:var(--green)">98.3<span style="font-size:15px;font-weight:400"> / 76.5</span></div>
+    <div class="d">逐份 98.3 分，汇总 76.5 分<br><b>判定：完全通过</b></div>
+  </div>
+  <div class="card">
+    <div class="h">同题（半自动链路）</div>
+    <div class="v">39.0<span style="font-size:15px;font-weight:400"> / 17.7</span></div>
+    <div class="d">逐份 39.0 分，汇总 17.7 分<br>未通过</div>
+  </div>
+  <div class="card">
+    <div class="h">资源消耗</div>
+    <div class="v">73<span style="font-size:15px;font-weight:400"> 轮 / 28 分钟</span></div>
+    <div class="d">505 万输入 token<br>85 次工具调用</div>
+  </div>
+</div>
+
+<div class="note stop">
+  <div class="lbl">为什么这个结果必须谨慎对待</div>
+  <p>98.3 分对 39.0 分，同一道题、同一个模型、同一份材料，差距 59 分。这个反差太大，我做了三项核查才敢写出来：</p>
+  <p><b>① 有没有偷看答案？</b>审计了它全部 85 次工具调用和 23 条 shell 命令，路径里没有任何 <code>evaluation/</code>、<code>reference/</code>、<code>gold.json</code> 的访问记录，也没有读取仓库评分目录。它读的都是导入后的只读文档。</p>
+  <p><b>② 是不是碰巧？</b>逐格比对了它的交付物和官方答案：288 格中 283 格完全一致，5 格不同（A04/A06 把 "taken as a whole" 判成 Yes、A07 判成 No，A12 的两项 industry 判断判成 Yes）。差异集中在同一类条款上，符合"个别定义条款没读准"的特征，不像复制答案。</p>
+  <p><b>③ 汇总题是不是心算蒙的？</b>它自建了 <code>work/build.py</code> 生成表格、<code>work/verify.py</code> 机械重算汇总题、<code>work/validate.py</code> 校验选项合法性，还调用了 6 次 <code>table_aggregate</code> 工具。这与产品里已有的确定性聚合能力一致。</p>
+</div>
+
+<h3>它实际是怎么做的</h3>
+
+<div class="tscroll"><table>
+  <thead><tr><th style="width:22%">阶段</th><th>行为</th></tr></thead>
+  <tbody>
+    <tr><td>规划</td><td>自主列出 16 份协议，生成任务计划：定位 MAE 定义页 → 逐份精读 → 填表 → 自检</td></tr>
+    <tr><td>检索</td><td>先全库搜 <code>"Material Adverse Effect" means, with respect to</code>（limit 20），再按单份文档逐个锁定定义页；中途改用"锚词组"批量检索（<code>taken as a whole</code>、<code>disproportionate</code>、<code>act of God</code>、<code>pandemic</code>）一次覆盖多份协议</td></tr>
+    <tr><td>精读</td><td>24 次 <code>document_get_pages</code>，读的是定义条与例外条款所在页</td></tr>
+    <tr><td>纠错</td><td>中途自己发现聚合题 M04 计数不一致，回头核对协议认定并修正（最终 M04 仍判错，说明纠错机制生效但结论未纠正到位）</td></tr>
+    <tr><td>交付</td><td>用脚本生成完整 288 行 <code>deal_points.csv</code> 与 <code>answers.json</code>，再用独立脚本重算校验一致性</td></tr>
+  </tbody>
+</table></div>
+
+<h3>交叉验证：三道题的自主成绩</h3>
+
+<p>单题通过不足以说明问题（第 1 题材料结构相对规整）。为避免"只挑好题"的质疑，又对另外两道题做了同样的端到端运行——一道是半自动链路得分最低的合同题（第 13 题，8.2 分），一道是刑事类里最好的题（第 19 题，70.8 分）：</p>
+
+<div class="chart">
+  <div class="chart-title">同一道题：半自动链路 vs 端到端自主 Agent</div>
+  <div class="chart-sub">柱长为综合得分；第 13 题自主运行触达 900 轮上限仍未产出完整交付物</div>
+  <svg viewBox="0 0 900 270" role="img" aria-label="半自动与端到端对比">
+    <g class="axis">
+      <text x="56" y="32">90</text><line class="grid" x1="70" y1="28" x2="860" y2="28"/>
+      <text x="56" y="80">60</text><line class="grid" x1="70" y1="76" x2="860" y2="76"/>
+      <text x="56" y="128">30</text><line class="grid" x1="70" y1="124" x2="860" y2="124"/>
+      <text x="56" y="176">0</text><line class="grid" x1="70" y1="172" x2="860" y2="172"/>
+    </g>
+    <g id="cmp-bars"></g>
+  </svg>
+  <div class="legend"><span><i style="background:#9aa4b0"></i>半自动链路（22 题批量口径）</span><span><i style="background:#2a6f5e"></i>端到端自主 Agent</span></div>
+</div>
+
+<div class="tscroll"><table>
+  <thead><tr><th>任务</th><th class="n">材料规模</th><th class="n">半自动</th><th class="n">自主</th><th>自主运行结局</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>WFA-LAW-001 · 合同</td><td class="n">16 份 / 18 项</td>
+      <td class="n">28.3</td><td class="n"><b style="color:var(--green)">87.4</b></td>
+      <td><span class="tag t-green">完全通过</span> 73 轮 / 28 分钟</td>
+    </tr>
+    <tr>
+      <td>WFA-LAW-019 · 刑事</td><td class="n">13 名被告</td>
+      <td class="n">70.8</td><td class="n"><b style="color:var(--green)">83.1</b></td>
+      <td><span class="tag t-amber">接近通过</span> 角色准确率 92.9%，未达全对门槛</td>
+    </tr>
+    <tr>
+      <td>WFA-LAW-013 · 合同</td><td class="n">20 份 / 15 项</td>
+      <td class="n">8.2</td><td class="n"><b style="color:var(--red)">0.0</b></td>
+      <td><span class="tag t-red">未完成</span> 900 轮上限耗尽，交付表大量写 needs_human</td>
+    </tr>
+  </tbody>
+</table></div>
+
+<div class="note warn">
+  <div class="lbl">第三行比第一行更重要</div>
+  <p>第 13 题自主运行跑满 900 轮、约 50 分钟，最终<b>没有产出可用的 <code>answers.json</code></b>，表格里大量格子写着 <code>needs_human</code>，官方评分 <b>0 分</b>。</p>
+  <p>但请注意它的收尾答复：它明确写了"<b>不能当成交付</b>"、"<b>页码尚未逐处回查</b>"、"任务完成度约 40%"。<b>产品没有假装完成，而是如实降级并列出待核实项</b>——这符合项目"证据不足必须标为待核实"的硬性要求，但从交付角度看，这题就是失败了。</p>
+  <p>所以正确的结论不是"产品很强"或"产品很弱"，而是：<b>能力上限很高（能通过 98 分的题），但稳定性差，遇到材料规模大、条款类型多的任务会在预算内做不完。</b></p>
+</div>
+
+<h2><span class="n">07</span>这次评测的边界与可信度</h2>
+
+<p>为了不让读者误读分数，以下几点必须讲清楚：</p>
+
+<ul>
+  <li><b>分数由官方程序算，但运行环境不是官方容器。</b>官方每题给 4 小时、独立容器；我们在本机独立工作目录里跑，每题未设硬性时限。放宽的只是"能跑多久"，不改变判分口径。</li>
+  <li><b>本轮没有边测边改。</b>发现问题的处理方式是：<b>不改产品代码</b>，只对"模型服务断连导致空批次"的任务做同口径重跑（断连是网络/服务端抖动，不是产品行为）。重跑了 10 道题，全部记入最终结果。</li>
+  <li><b>断连确实影响了部分题目。</b>本轮共出现 20 余次模型连接中断，集中在刑事类（多批 4 人并行生成时）。已对受影响批次加 3 次重试；重试后第 15 题从"判出 10 人"恢复到"判出 18 人"，第 16 题从 52.4 分升到 71.3 分。剩余 3 道题（17/18/20）仍有漏判，已如实保留。</li>
+  <li><b>两套口径要分开看。</b>22 题批量分（31.6）衡量的是"固定流水线"的效果；端到端自主分（001 题 87.4、019 题 83.1、013 题 0）衡量的是"产品真实使用"的效果。两者不能相加、不能平均，也不该互相替代。</li>
+  <li><b>端到端只跑了 3 道题，样本小。</b>1 道通过、1 道接近、1 道失败，无法给出"平均通过率"。它的价值在于证明能力上限与失败模式，而不是给出总体分数。</li>
+  <li><b>模型是同一个。</b>两轮、两种口径都用 deepseek-v4.1-flash，没有为了提分换更强的模型。</li>
+  <li><b>0 道批量通过不等于 0 分。</b>官方门槛极高（逐份 90% + 汇总 75%），批量最高分 70.8 分；但同一体系下的自主运行已经能越过这道门槛（98.3/76.5）。</li>
+</ul>
+
+<h2><span class="n">08</span>如果继续优化，优先级是什么</h2>
+
+<p>按"拿到分数最难、但最容易补"的顺序排：</p>
+
+<ol>
+  <li><b>先把"做不完"变成"做完"。</b>第 13 题自主运行 900 轮仍未写出 <code>answers.json</code>，这是当前最贵的一块钱：从 0 分到 30 分只需要让它<b>按时收尾并落盘</b>。具体做法：把 20 份协议按 4–5 份分批，每批结束就强制覆盖写回完整 CSV；聚合题单独一轮生成，不依赖全部逐份完成。</li>
+  <li><b>把表格类任务改成"脚本生成"而非"逐格对话"。</b>第 1 题成功的核心原因是 Agent 自己写了 <code>build.py</code> 从检索结果批量生成 288 行。把这个行为产品化（内置"结构化抽取 → 表格"工具链）比让模型逐格输出稳定得多。</li>
+  <li><b>把汇总题全部交给确定性聚合。</b>第 1 题 17 道聚合题有 13 道满分，靠的是 <code>table_aggregate</code> 机械计算；批量链路里汇总只有 9.6 分，靠模型心算。统一走工具，差距会直接补上。</li>
+  <li><b>定义类条款做"定义页优先"检索。</b>批量链路里 31 份合同整份零分，都源于没命中定义条。对 MAE / Knowledge / Remedies 这类定义，应优先返回"X means"结构所在页，而不是正文引用句。</li>
+  <li><b>刑事类按被告切分证据配额。</b>18 人题全部判出、15 人题却漏 4 人，说明瓶颈是"低提及度被告被淹没"，不是人数。需要给每名被告独立的检索配额与最少证据条数，而不是全局检索后拼接。</li>
+</ol>
+
+<div class="note">
+  <div class="lbl">一句话总结</div>
+  <p>LawBuddy <b>已经具备通过这道考题的能力</b>（合同题 98.3/76.5、刑事题 90.5/75.7），挡住它的是<b>稳定性</b>：同样的能力，在 16 份合同上能拿 87 分，在 20 份合同上却因预算耗尽交不出答案。下一步不该继续提高"单点准确率"，而该解决<b>任务规模与预算的匹配</b>——分批、强制落盘、确定性聚合、按人分配证据。</p>
+</div>
+
+<footer>
+  <p>评测题目与评分程序来自 WorkflowArena 公开仓库（<code>github.com/Einsia/WorkflowArena</code>）。22 道法律任务的原始输入、官方 <code>verify.py</code> 评分脚本、逐题产物与评分 JSON，以及 3 次端到端自主运行的完整事件日志，均保留在本地评测目录，可复查。所有分数由官方评分程序产出，未经手工调整。</p>
+  <p>报告生成时间：2026-11-12 · 本轮共执行 35 次任务运行（22 题批量首跑 + 10 题断连重跑 + 3 题端到端自主）</p>
+</footer>
+
+</div>
+<script>
+const DATA = [
+ {t:"001",k:"c",b:0.3899,m:0.1765,rw:0.2832,p:0.2787,cov:0.535,n:16},
+ {t:"002",k:"c",b:0.3258,m:0.0625,rw:0.1941,p:0.2007,cov:0.371,n:15},
+ {t:"003",k:"c",b:0.2859,m:0.0588,rw:0.1724,p:0.1371,cov:0.340,n:18},
+ {t:"004",k:"c",b:0.4875,m:0.1875,rw:0.3375,p:0.2521,cov:0.571,n:15},
+ {t:"005",k:"c",b:0.4571,m:0.1176,rw:0.2873,p:0.3040,cov:0.543,n:14},
+ {t:"006",k:"c",b:0.3478,m:0.0588,rw:0.2033,p:0.2107,cov:0.492,n:16},
+ {t:"007",k:"c",b:0.2462,m:0.0000,rw:0.1231,p:0.2216,cov:0.304,n:15},
+ {t:"008",k:"c",b:0.1634,m:0.0625,rw:0.1129,p:0.1146,cov:0.199,n:18},
+ {t:"009",k:"c",b:0.4000,m:0.1765,rw:0.2883,p:0.2612,cov:0.490,n:14},
+ {t:"010",k:"c",b:0.4249,m:0.1176,rw:0.2712,p:0.1763,cov:0.496,n:12},
+ {t:"011",k:"c",b:0.3384,m:0.1176,rw:0.2280,p:0.2371,cov:0.432,n:12},
+ {t:"012",k:"c",b:0.4883,m:0.1176,rw:0.3029,p:0.3002,cov:0.583,n:20},
+ {t:"013",k:"c",b:0.1643,m:0.0000,rw:0.0822,p:0.0999,cov:0.270,n:20},
+ {t:"014",k:"m",b:0.3750,m:0.2083,rw:0.2917,p:0.3250,n:8,j:8,role:0.125},
+ {t:"015",k:"m",b:0.4778,m:0.2667,rw:0.3722,p:0.3722,n:18,j:18,role:0.3333},
+ {t:"016",k:"m",b:0.7133,m:0.6167,rw:0.6650,p:0.4828,n:12,j:12,role:0.9167},
+ {t:"017",k:"m",b:0.6667,m:0.5467,rw:0.6067,p:0.5267,n:15,j:11,role:0.4667},
+ {t:"018",k:"m",b:0.3972,m:0.1667,rw:0.2819,p:0.2320,n:9,j:5,role:0.1667},
+ {t:"019",k:"m",b:0.5487,m:0.8667,rw:0.7077,p:0.7000,n:13,j:13,role:1.0},
+ {t:"020",k:"m",b:0.2727,m:0.3167,rw:0.2947,p:0.3932,n:11,j:7,role:0.0833},
+ {t:"021",k:"m",b:0.6476,m:0.3238,rw:0.4857,p:0.4191,n:14,j:14,role:0.4286},
+ {t:"022",k:"m",b:0.3630,m:0.3515,rw:0.3572,p:0.4239,n:9,j:9,role:0.3636}
+];
+const P={part:{'001':0.2055,'002':0.2854,'003':0.2424,'004':0.4096,'005':0.3093,'006':0.1674,'007':0.1468,'008':0.1834,'009':0.3582,'010':0.2853,'011':0.2288,'012':0.2561,'013':0.0656}};
+const NS="http://www.w3.org/2000/svg";
+function el(n,a){const e=document.createElementNS(NS,n);for(const k in a)e.setAttribute(k,a[k]);return e;}
+
+/* 合同柱状图 */
+(function(){
+  const g=document.getElementById('c-bars'); const c=DATA.filter(d=>d.k==='c');
+  const x0=70, x1=860, top=8, bot=272, w=(x1-x0)/c.length;
+  const scale=(bot-top)/0.90;   // 纵轴 0→272、90→8，故每 1 分 = 293.3px
+  c.forEach((d,i)=>{
+    const h=scale*d.rw, x=x0+i*w+w*0.22, bw=w*0.56;
+    const col=d.rw>=0.30?'#3a7ca5':(d.rw>=0.20?'#6b93b5':'#a8382d');
+    g.appendChild(el('rect',{x:x,y:bot-h,width:bw,height:h,fill:col,rx:2}));
+    const v=el('text',{x:x+bw/2,y:bot-h-5,'text-anchor':'middle',class:'bar-val'});v.textContent=Math.round(d.rw*100);g.appendChild(v);
+    const l=el('text',{x:x+bw/2,y:bot+16,'text-anchor':'middle',class:'bar-lbl'});l.textContent='合同'+d.t.slice(1);g.appendChild(l);
+  });
+})();
+
+/* 刑事柱状图 */
+(function(){
+  const g=document.getElementById('m-bars'); const c=DATA.filter(d=>d.k==='m');
+  const x0=70, x1=860, top=8, bot=272, w=(x1-x0)/c.length;
+  const scale=(bot-top)/0.90;
+  c.forEach((d,i)=>{
+    const h=scale*d.rw, x=x0+i*w+w*0.2, bw=w*0.6;
+    g.appendChild(el('rect',{x:x,y:bot-h,width:bw,height:h,fill:'#5b4a8a',rx:2}));
+    const v=el('text',{x:x+bw/2,y:bot-h-5,'text-anchor':'middle',class:'bar-val'});v.textContent=Math.round(d.rw*100);g.appendChild(v);
+    const l=el('text',{x:x+bw/2,y:bot+16,'text-anchor':'middle',class:'bar-lbl'});l.textContent='刑事'+d.t.slice(1);g.appendChild(l);
+    const miss=d.n-d.j;
+    const s=el('text',{x:x+bw/2,y:bot+31,'text-anchor':'middle',class:'axis'});
+    s.textContent=miss>0?('漏判'+miss+'人'):(d.n+'人全判');g.appendChild(s);
+  });
+})();
+
+/* 变化图 */
+(function(){
+  const g=document.getElementById('delta-bars'); const all=DATA.slice();
+  const x0=70, x1=860, mid=120, w=(x1-x0)/all.length, scale=430;
+  all.forEach((d,i)=>{
+    const dv=d.rw-d.p, h=Math.abs(dv)*scale, x=x0+i*w+w*0.24, bw=w*0.52;
+    const flat=Math.abs(dv)<0.005;
+    const col=flat?'#9aa4b0':(dv>0?'#2a6f5e':'#a8382d');
+    const y=dv>=0?mid-h:mid;
+    g.appendChild(el('rect',{x:x,y:y,width:bw,height:Math.max(h,2),fill:col,rx:2,opacity:.9}));
+    const l=el('text',{x:x+bw/2,y:250,'text-anchor':'middle',class:'axis'});
+    l.textContent=d.t.slice(1);g.appendChild(l);
+    // 数值标签贴柱顶外侧；题号固定在底部独立一行，二者不再同区
+    const vy=dv>=0?(mid-Math.max(h,2)-6):(mid+Math.max(h,2)+15);
+    const v=el('text',{x:x+bw/2,y:vy,'text-anchor':'middle',class:'bar-val'});
+    v.textContent=(flat?'0':((dv>0?'+':'')+Math.round(dv*100)));v.setAttribute('fill',col);g.appendChild(v);
+  });
+})();
+
+/* 散点图 */
+(function(){
+  const g=document.getElementById('scatter');
+  const ax=document.getElementById('scatter-axis');
+  const c=DATA.filter(d=>d.k==='c');
+  const x0=90,x1=850,y0=266,y1=32;
+  [['0%',0],['15%',0.15],['30%',0.30],['45%',0.45]].forEach(([s,v])=>{
+    const y=y0-(v/0.50)*(y0-y1);
+    ax.appendChild(el('line',{class:'grid',x1:x0,y1:y,x2:x1,y2:y}));
+    const t=el('text',{x:x0-8,y:y+4,'text-anchor':'end',class:'axis'});t.textContent=s;ax.appendChild(t);
+  });
+  c.forEach((d,i)=>{
+    const cx=x0+(d.cov/0.60)*(x1-x0);
+    const cy=y0-(d.b/0.50)*(y0-y1);
+    g.appendChild(el('circle',{cx:cx,cy:cy,r:6.5,fill:'#3a7ca5',opacity:.85}));
+    // 相邻点极近时标签上下交错，避免互相压盖
+    const t=el('text',{x:cx,y:i%2?cy+17:cy-13,'text-anchor':'middle',class:'axis'});t.textContent=d.t.slice(1);g.appendChild(t);
+  });
+  ['0%','20%','40%','60%'].forEach((s,i)=>{
+    const x=x0+(i*0.2/0.6)*(x1-x0);
+    const t=el('text',{x:x,y:283,'text-anchor':'middle',class:'axis'});t.textContent=s;g.appendChild(t);
+  });
+  const lx=el('text',{x:(x0+x1)/2,y:297,'text-anchor':'middle',class:'axis'});
+  lx.textContent='已填写格子占比 →';g.appendChild(lx);
+  const ly=el('text',{x:44,y:150,'text-anchor':'middle',class:'axis',transform:'rotate(-90 44 150)'});
+  ly.textContent='逐份答题得分 →';g.appendChild(ly);
+})();
+
+/* 汇总题对比 */
+(function(){
+  const g=document.getElementById('merge-bars'); const c=DATA.filter(d=>d.k==='c');
+  const x0=70,x1=860,bot=216,w=(x1-x0)/c.length,top=8,scale=(bot-top)/0.60;
+  c.forEach((d,i)=>{
+    const ex=d.m, pa=P.part[d.t]||0;
+    const bw=w*0.30, x=x0+i*w+w*0.16;
+    g.appendChild(el('rect',{x:x,y:bot-ex*scale,width:bw,height:Math.max(ex*scale,1),fill:'#8d99a6',rx:1.5}));
+    g.appendChild(el('rect',{x:x+bw+2,y:bot-pa*scale,width:bw,height:Math.max(pa*scale,1),fill:'#3a7ca5',rx:1.5}));
+    const l=el('text',{x:x+bw,y:bot+16,'text-anchor':'middle',class:'axis'});l.textContent=d.t.slice(1);g.appendChild(l);
+  });
+})();
+
+/* 被告完成度 */
+(function(){
+  const g=document.getElementById('def-bars'); const c=DATA.filter(d=>d.k==='m');
+  const x0=70,x1=860,ytop=30,w=(x1-x0)/c.length,rowh=22;
+  c.sort((a,b)=>a.n-b.n).forEach((d,i)=>{
+    const y=ytop+i*rowh+8;
+    const lbl=el('text',{x:x0-10,y:y+12,'text-anchor':'end',class:'bar-lbl'});
+    lbl.textContent='WFA-'+d.t;g.appendChild(lbl);
+    const total=(x1-x0)*0.72, per=total/Math.max(...c.map(x=>x.n));
+    g.appendChild(el('rect',{x:x0,y:y,width:d.n*per,height:14,fill:'#c9d2db',rx:2}));
+    g.appendChild(el('rect',{x:x0,y:y,width:d.j*per,height:14,fill:'#3a7ca5',rx:2}));
+    const t=el('text',{x:x0+d.n*per+10,y:y+11,class:'bar-val'});
+    t.textContent=d.j+'/'+d.n+(d.j<d.n?'  漏'+(d.n-d.j):'');g.appendChild(t);
+  });
+})();
+
+/* 半自动 vs 端到端 */
+(function(){
+  const g=document.getElementById('cmp-bars');
+  const rows=[{n:'合同 001',a:0.2832,b:0.8745},{n:'刑事 019',a:0.7077,b:0.8308},{n:'合同 013',a:0.0822,b:0.0}];
+  const x0=110, x1=840, bot=172, top=28, w=(x1-x0)/rows.length, scale=(bot-top)/0.90;
+  rows.forEach((d,i)=>{
+    const bw=w*0.28, x=x0+i*w+w*0.2;
+    const ha=d.a*scale, hb=d.b*scale;
+    g.appendChild(el('rect',{x:x,y:bot-ha,width:bw,height:Math.max(ha,1.5),fill:'#9aa4b0',rx:2}));
+    g.appendChild(el('rect',{x:x+bw+4,y:bot-hb,width:bw,height:Math.max(hb,1.5),fill:'#2a6f5e',rx:2}));
+    const va=el('text',{x:x+bw/2,y:bot-Math.max(ha,1.5)-5,'text-anchor':'middle',class:'bar-val'});va.textContent=Math.round(d.a*100);g.appendChild(va);
+    const vb=el('text',{x:x+bw*2,y:bot-Math.max(hb,1.5)-5,'text-anchor':'middle',class:'bar-val',fill:'#2a6f5e'});vb.textContent=Math.round(d.b*100);g.appendChild(vb);
+    const l=el('text',{x:x+bw,y:bot+17,'text-anchor':'middle',class:'bar-lbl'});l.textContent=d.n;g.appendChild(l);
+  });
+})();
+
+/* 明细表 */
+(function(){
+  const tb=document.getElementById('detail-rows');
+  DATA.forEach(d=>{
+    const tr=document.createElement('tr');
+    const dv=d.rw-d.p;
+    const tag=dv>0.005?'<span class="tag t-green">+'+Math.round(dv*100)+'</span>':
+              (dv<-0.005?'<span class="tag t-red">'+Math.round(dv*100)+'</span>':'<span class="tag t-gray">0</span>');
+    tr.innerHTML='<td>WFA-LAW-'+d.t+'</td><td>'+(d.k==='c'?'合同':'刑事')+'</td>'+
+      '<td class="n">'+Math.round(d.b*100)+'</td><td class="n">'+Math.round(d.m*100)+'</td>'+
+      '<td class="n"><b>'+Math.round(d.rw*100)+'</b></td><td class="n">'+Math.round(d.p*100)+'</td>'+
+      '<td class="n">'+tag+'</td>';
+    tb.appendChild(tr);
+  });
+})();
+</script>
+</body>
+</html>

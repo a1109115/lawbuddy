@@ -484,9 +484,12 @@ def _run_checkpoint_restore(report: dict[str, Any], case_id: str) -> tuple[list[
 
 def _run_compaction_state(report: dict[str, Any], case_id: str) -> tuple[list[dict[str, Any]], bool]:
     from lawbuddy.agent.autonomous import (
-        _STATE_MARK, _compact_messages, _ledger_summary, _plan_section, _record_evidence,
-        _record_issues,
+        CONTEXT_COMPACT_THRESHOLD_CHARS, _STATE_MARK, _compact_messages, _ledger_summary,
+        _plan_section, _record_evidence, _record_issues,
     )
+
+    def _compact_threshold() -> int:
+        return int(CONTEXT_COMPACT_THRESHOLD_CHARS)
 
     state = _state(case_id, depth="full_review")
     _record_evidence(state, [
@@ -499,7 +502,11 @@ def _run_compaction_state(report: dict[str, Any], case_id: str) -> tuple[list[di
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": base + _plan_section([{"text": "读材料", "status": "done"}])},
     ]
-    for i in range(12):
+    # 轮数按压缩阈值推算：阈值随上下文窗口调整后，写死的 12 轮可能不再触发压缩，
+    # 而这条断言要验证的是「历史超阈值必定被压缩」。
+    per_round = 8000 + 2000
+    rounds = max(12, _compact_threshold() // per_round + 2)
+    for i in range(rounds):
         messages.append({"role": "assistant", "content": f"第 {i} 轮过程说明" + "字" * 8000,
                          "tool_calls": [{"id": f"t{i}", "type": "function",
                                          "function": {"name": "document_search",

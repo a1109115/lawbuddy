@@ -1137,6 +1137,447 @@ ALTER TABLE docgen_templates ADD COLUMN field_mapping_json TEXT;
 ALTER TABLE docgen_templates ADD COLUMN format_warnings_json TEXT;
 """
 
+V49__TASK_DELIVERABLES = """
+-- 声明式交付契约（WFA-LAW 优化方案 §4.2 / P0-04）：任务创建时可携带交付物
+-- 声明（文件名 + 格式 + 表头/主键），任务启动即在 submission/ 生成可解析骨架，
+-- 运行中按主键增量回写。可选字段，为空表示该任务不启用交付骨架。
+ALTER TABLE tasks ADD COLUMN deliverables_json TEXT;
+"""
+
+V50__AGENT_HARNESS = """
+-- Agent Harness 优化升级（LB-HARNESS-2026-01 §4.1）：
+-- 工作单元 / 答案格 / 交付物 / 运行时状态四张表，把大卷宗任务的工作全集与
+-- 交付进度从模型上下文挪到数据库。只新增表与索引，不回填旧任务事实状态；
+-- 旧任务（V1 运行时）不写这些表，仍按原检查点恢复。
+
+-- 工作单元：任务契约编译出的最小可调度工作项（文档 × 问题、被告 × 字段等）。
+CREATE TABLE agent_work_units (
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  work_unit_id TEXT NOT NULL,
+  scope_type TEXT NOT NULL,
+  scope_json TEXT NOT NULL DEFAULT '{}',
+  dependencies_json TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','leased','extracting','staged','verified','committed','needs_human','blocked')),
+  priority INTEGER NOT NULL DEFAULT 100,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 3,
+  cost_json TEXT NOT NULL DEFAULT '{}',
+  output_ref TEXT,
+  last_error_code TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (task_id, work_unit_id)
+);
+
+CREATE INDEX idx_agent_work_units_status ON agent_work_units(task_id, status, priority);
+CREATE INDEX idx_agent_work_units_priority ON agent_work_units(task_id, priority, updated_at);
+
+-- 答案格：交付表的一格（行主键 + 列），带来源与证据状态。
+CREATE TABLE agent_cell_results (
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  artifact_name TEXT NOT NULL,
+  cell_key TEXT NOT NULL,
+  value_json TEXT NOT NULL DEFAULT 'null',
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','committed','needs_human','blocked','stale')),
+  document_id TEXT,
+  version_id TEXT,
+  page_no INTEGER,
+  quote TEXT,
+  reason_code TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (task_id, artifact_name, cell_key)
+);
+
+CREATE INDEX idx_agent_cell_results_status ON agent_cell_results(task_id, status, updated_at);
+CREATE INDEX idx_agent_cell_results_version ON agent_cell_results(task_id, document_id, version_id);
+
+-- 交付物登记：主/派生交付物的行覆盖与原子写入结果（只记哈希与路径，不存内容）。
+CREATE TABLE agent_artifacts (
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  schema_version INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','partial','complete','invalid')),
+  rows_expected INTEGER NOT NULL DEFAULT 0,
+  rows_committed INTEGER NOT NULL DEFAULT 0,
+  content_sha256 TEXT,
+  storage_path TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (task_id, name)
+);
+
+CREATE INDEX idx_agent_artifacts_status ON agent_artifacts(task_id, status, updated_at);
+
+-- 运行时状态：运行时版本钉住与预算计数（恢复时不得跨 V1/V2）。
+CREATE TABLE agent_runtime_state (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+  runtime_version TEXT NOT NULL DEFAULT 'v1'
+    CHECK (runtime_version IN ('v1','v2','legacy')),
+  schema_version INTEGER NOT NULL DEFAULT 1,
+  rounds_used INTEGER NOT NULL DEFAULT 0,
+  tool_calls_used INTEGER NOT NULL DEFAULT 0,
+  model_calls_used INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  explore_rounds_used INTEGER NOT NULL DEFAULT 0,
+  started_at TEXT,
+  state_json TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT NOT NULL
+);
+"""
+
+V51__AGENT_RUNTIME_V3 = """
+-- Agent Runtime V3 底座（LB-HERMES-2026-01 §6.1）：工具 Journal、工具结果 blob、
+-- 任务租约、运行时 Span、预算预留与子代理运行记录。
+-- 只新增表与索引；不改动 V1-V50 已发布迁移文本。
+
+-- 工具调用 Journal：执行前先落 staged，崩溃后可对账。
+-- task_id + call_id 唯一，保证同一轮同一调用不会重复登记；
+-- args_hash 用于审批绑定与参数变更失效；effect 描述副作用类别；
+-- idempotency_key 供可重试工具在恢复时判定是否可安全重放。
+-- owner_id + fencing_token 阻止过期 Worker 覆盖新结果。
+-- 结果正文不落本表（只存 result_ref + result_sha256），正文进加密 blob。
+CREATE TABLE tool_call_journal (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  call_id TEXT NOT NULL,
+  tool_name TEXT NOT NULL,
+  tool_version TEXT NOT NULL DEFAULT '1',
+  conversation_id TEXT,
+  subagent_id TEXT,
+  origin TEXT NOT NULL DEFAULT 'main',
+  args_hash TEXT NOT NULL DEFAULT '',
+  effect TEXT NOT NULL DEFAULT 'read'
+    CHECK (effect IN ('read','write','deliverable','memory','external','shell')),
+  idempotent INTEGER NOT NULL DEFAULT 0,
+  idempotency_key TEXT,
+  status TEXT NOT NULL DEFAULT 'staged'
+    CHECK (status IN ('staged','executing','succeeded','failed_retryable','failed_final','unknown','cancelled')),
+  attempt INTEGER NOT NULL DEFAULT 1,
+  owner_id TEXT,
+  fencing_token INTEGER NOT NULL DEFAULT 0,
+  result_ref TEXT,
+  result_sha256 TEXT,
+  error_code TEXT,
+  started_at TEXT,
+  finished_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (task_id, call_id)
+);
+
+CREATE INDEX idx_tool_journal_status ON tool_call_journal(task_id, status, updated_at);
+CREATE INDEX idx_tool_journal_effect ON tool_call_journal(task_id, effect, status);
+CREATE INDEX idx_tool_journal_owner ON tool_call_journal(owner_id, status);
+
+-- 工具结果正文：加密 blob 引用（工作空间 blobs/ 下的密文），本表只存元数据。
+CREATE TABLE tool_result_blobs (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  journal_id TEXT NOT NULL REFERENCES tool_call_journal(id) ON DELETE CASCADE,
+  content_sha256 TEXT NOT NULL,
+  byte_size INTEGER NOT NULL DEFAULT 0,
+  storage_path TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_tool_result_blobs_journal ON tool_result_blobs(journal_id);
+
+-- 任务租约：单一所有者执行任务，fencing_token 单调递增。
+CREATE TABLE task_leases (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+  owner_id TEXT NOT NULL,
+  fencing_token INTEGER NOT NULL DEFAULT 1,
+  lease_expires_at TEXT NOT NULL,
+  acquired_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_task_leases_expiry ON task_leases(lease_expires_at);
+
+-- 运行时 Span：只记录耗时、状态、错误码、计数与父子关系；禁止写入
+-- 查询词、文件路径、工具参数、引文和错误响应正文（WP03）。
+CREATE TABLE runtime_spans (
+  span_id TEXT PRIMARY KEY,
+  trace_id TEXT NOT NULL,
+  parent_span_id TEXT,
+  task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+  conversation_id TEXT,
+  call_id TEXT,
+  subagent_id TEXT,
+  runtime_version TEXT,
+  kind TEXT NOT NULL
+    CHECK (kind IN ('task','round','model','tool','subagent','compaction','retrieval','delivery','other')),
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'running'
+    CHECK (status IN ('running','ok','error','cancelled','dropped')),
+  error_code TEXT,
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  budget_cost_json TEXT NOT NULL DEFAULT '{}',
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  duration_ms INTEGER,
+  attributes_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX idx_runtime_spans_trace ON runtime_spans(trace_id, started_at);
+CREATE INDEX idx_runtime_spans_task ON runtime_spans(task_id, started_at);
+CREATE INDEX idx_runtime_spans_kind ON runtime_spans(kind, started_at);
+
+-- 预算预留：主/子 Agent 原子预留—结算—释放，防止并发逃逸。
+CREATE TABLE task_budget_reservations (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  owner_id TEXT NOT NULL,
+  subagent_id TEXT,
+  resource TEXT NOT NULL
+    CHECK (resource IN ('round','tool_call','model_call','prompt_token','completion_token','wall_ms')),
+  amount INTEGER NOT NULL,
+  unit TEXT NOT NULL DEFAULT 'count' CHECK (unit IN ('count','token','ms')),
+  status TEXT NOT NULL DEFAULT 'reserved'
+    CHECK (status IN ('reserved','settled','released')),
+  spent INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_budget_reservations_task ON task_budget_reservations(task_id, status);
+
+-- 子代理运行：只读深度 1；结果先 staging，主 Agent 验引后提交。
+CREATE TABLE subagent_runs (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  parent_id TEXT,
+  kind TEXT NOT NULL DEFAULT 'explore'
+    CHECK (kind IN ('explore','work_unit','batch')),
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','running','staged','accepted','rejected','failed','cancelled')),
+  scope_json TEXT NOT NULL DEFAULT '{}',
+  result_ref TEXT,
+  rounds_used INTEGER NOT NULL DEFAULT 0,
+  tool_calls_used INTEGER NOT NULL DEFAULT 0,
+  cancel_reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_subagent_runs_task ON subagent_runs(task_id, status);
+"""
+
+# V51 同事务内的运行时表重建：放宽 runtime_version CHECK 到 v3。
+# 表重建沿用 SQLite 推荐的 新建—拷贝—删除—改名 流程，保留全部旧行。
+V51__REBUILD_AGENT_RUNTIME_STATE = """
+CREATE TABLE agent_runtime_state_v3 (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+  runtime_version TEXT NOT NULL DEFAULT 'v1'
+    CHECK (runtime_version IN ('v1','v2','v3','legacy')),
+  schema_version INTEGER NOT NULL DEFAULT 1,
+  rounds_used INTEGER NOT NULL DEFAULT 0,
+  tool_calls_used INTEGER NOT NULL DEFAULT 0,
+  model_calls_used INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  explore_rounds_used INTEGER NOT NULL DEFAULT 0,
+  started_at TEXT,
+  state_json TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT NOT NULL
+);
+
+INSERT INTO agent_runtime_state_v3(
+  task_id, runtime_version, schema_version, rounds_used, tool_calls_used, model_calls_used,
+  prompt_tokens, completion_tokens, explore_rounds_used, started_at, state_json, updated_at)
+SELECT task_id, runtime_version, schema_version, rounds_used, tool_calls_used, model_calls_used,
+  prompt_tokens, completion_tokens, explore_rounds_used, started_at, state_json, updated_at
+FROM agent_runtime_state;
+
+DROP TABLE agent_runtime_state;
+
+ALTER TABLE agent_runtime_state_v3 RENAME TO agent_runtime_state;
+"""
+
+V51__AGENT_RUNTIME_V3_FULL = V51__AGENT_RUNTIME_V3 + ";" + V51__REBUILD_AGENT_RUNTIME_STATE
+
+V52__CONVERSATION_AND_ARCHIVES = """
+-- WP04/WP05：上下文压缩归档、会话全文检索、会话分支与产物快照。
+-- 只新增表与索引；不改动已发布迁移文本。
+
+-- 压缩前完整 transcript 的加密归档（正文在加密 blob，本表只存元数据）。
+-- watermark = 压缩前消息指纹，用于 watermark + CAS 写保护。
+CREATE TABLE context_archives (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  watermark TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  byte_size INTEGER NOT NULL DEFAULT 0,
+  message_count INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL DEFAULT 'compaction',
+  storage_path TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_context_archives_task ON context_archives(task_id, created_at DESC);
+
+-- 会话全文检索（trigram，与 pages_fts / memories_fts 一致）。
+-- case_id 强制入索引列，所有查询必须在 SQL 层带 case_id 过滤（禁止跨案）。
+CREATE VIRTUAL TABLE conversation_fts USING fts5(
+  message_id UNINDEXED,
+  conversation_id UNINDEXED,
+  case_id UNINDEXED,
+  role UNINDEXED,
+  content,
+  tokenize = 'trigram'
+);
+
+-- 会话分支：只记录锚点与前序引用，消息本身按锚点复制，不复制任务/审批/Journal。
+CREATE TABLE conversation_branches (
+  id TEXT PRIMARY KEY,
+  case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE RESTRICT,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  parent_conversation_id TEXT,
+  anchor_message_id TEXT,
+  anchor_created_at TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_conversation_branches_conv ON conversation_branches(conversation_id);
+
+-- 产物快照：只覆盖工作副本与交付物（加密 blob + 内容哈希），不得覆盖原件。
+CREATE TABLE artifact_snapshots (
+  id TEXT PRIMARY KEY,
+  case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE RESTRICT,
+  task_id TEXT,
+  artifact_kind TEXT NOT NULL CHECK (artifact_kind IN ('deliverable','working_copy','draft','other')),
+  name TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  byte_size INTEGER NOT NULL DEFAULT 0,
+  storage_path TEXT NOT NULL,
+  note TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_artifact_snapshots_case ON artifact_snapshots(case_id, created_at DESC);
+CREATE INDEX idx_artifact_snapshots_task ON artifact_snapshots(task_id);
+"""
+
+V53__LEARNING_PROPOSALS = """
+-- WP08：受控持续学习提案（工作空间库，与案件/记忆同域）。
+-- 只新增表与索引；不改动已发布迁移文本。
+
+-- 学习提案：后台复审产出统一落此表，批准前不得进入 Prompt、召回或正式记忆。
+-- base_hash 是提案生成时的基线指纹；与最新值不一致即冲突，必须重新审查
+-- （禁止用旧提案覆盖新值）。
+CREATE TABLE learning_proposals (
+  id TEXT PRIMARY KEY,
+  case_id TEXT REFERENCES cases(id) ON DELETE RESTRICT,
+  task_id TEXT,
+  proposal_kind TEXT NOT NULL
+    CHECK (proposal_kind IN ('case_memory','user_profile','skill_update','dedupe','archive')),
+  target_key TEXT NOT NULL,
+  base_hash TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','approved','rejected','stale','superseded')),
+  diff_json TEXT NOT NULL DEFAULT '{}',
+  source_json TEXT NOT NULL DEFAULT '{}',
+  rationale TEXT NOT NULL DEFAULT '',
+  impact_json TEXT NOT NULL DEFAULT '{}',
+  scan_json TEXT NOT NULL DEFAULT '{}',
+  reviewer_note TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_learning_proposals_status ON learning_proposals(status, created_at DESC);
+CREATE INDEX idx_learning_proposals_case ON learning_proposals(case_id, status);
+CREATE INDEX idx_learning_proposals_target ON learning_proposals(target_key, status);
+"""
+
+V54__PLUGIN_INSTALLATIONS = """
+-- WP10：插件安装与运行状态持久化（工作空间库）。
+-- 插件注册不能只存在内存：重启后必须仍能看到"已安装未启用"及原授权范围，
+-- 否则用户无法审计自己授过什么，也无法安全卸载。
+-- 默认 installed=1 但 enabled=0：安装不等于启用，启用仍需逐项授权。
+
+CREATE TABLE plugin_installations (
+  plugin_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  version TEXT NOT NULL,
+  license TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  tools_json TEXT NOT NULL DEFAULT '[]',
+  capabilities_json TEXT NOT NULL DEFAULT '{}',
+  granted_json TEXT NOT NULL DEFAULT '[]',
+  cases_json TEXT NOT NULL DEFAULT '[]',
+  source TEXT NOT NULL DEFAULT '',
+  installed INTEGER NOT NULL DEFAULT 1,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_plugin_installations_enabled
+  ON plugin_installations(enabled, updated_at DESC);
+
+-- 运行状态：只记技术字段（进程是否存在、上次错误类别），不记命令行与环境变量。
+CREATE TABLE plugin_runtime_state (
+  plugin_id TEXT PRIMARY KEY
+    REFERENCES plugin_installations(plugin_id) ON DELETE CASCADE,
+  running INTEGER NOT NULL DEFAULT 0,
+  last_error_code TEXT,
+  last_started_at TEXT,
+  updated_at TEXT NOT NULL
+);
+"""
+
+PROFILE_V2__SKILL_STAGING_AND_VERSIONS = """
+-- WP09：技能暂存与版本（设备级库，与 skills 同域）。
+-- 已启用技能不可被后台任务直接覆盖：安装与自动修改先落 staging，
+-- 扫描与人工批准后才生成新 skill_version，可 diff 与回滚。
+
+CREATE TABLE skill_staging (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  prompt_md TEXT NOT NULL,
+  allowed_tools_json TEXT NOT NULL DEFAULT '[]',
+  description TEXT NOT NULL DEFAULT '',
+  source_origin TEXT NOT NULL DEFAULT 'local://paste',
+  base_version_id TEXT,
+  base_hash TEXT NOT NULL DEFAULT '',
+  scan_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','blocked','approved','rejected')),
+  block_reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_skill_staging_status ON skill_staging(status, created_at DESC);
+CREATE INDEX idx_skill_staging_name ON skill_staging(name, status);
+
+CREATE TABLE skill_versions (
+  id TEXT PRIMARY KEY,
+  skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+  version_no INTEGER NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  prompt_md TEXT NOT NULL,
+  allowed_tools_json TEXT NOT NULL DEFAULT '[]',
+  description TEXT NOT NULL DEFAULT '',
+  source_origin TEXT NOT NULL DEFAULT 'local://paste',
+  base_version_id TEXT,
+  scan_json TEXT NOT NULL DEFAULT '{}',
+  active INTEGER NOT NULL DEFAULT 0,
+  note TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE (skill_id, version_no)
+);
+
+CREATE INDEX idx_skill_versions_active ON skill_versions(skill_id, active, version_no DESC);
+"""
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, V1__WORKSPACE_CASES_DOCUMENTS),
     (2, V2__AUDIT_LOGS),
@@ -1185,6 +1626,12 @@ MIGRATIONS: list[tuple[int, str]] = [
     (46, V46__DROP_BILLING),
     (47, V47__HUMAN_QUESTIONS),
     (48, V48__DOCX_TEMPLATES),
+    (49, V49__TASK_DELIVERABLES),
+    (50, V50__AGENT_HARNESS),
+    (51, V51__AGENT_RUNTIME_V3_FULL),
+    (52, V52__CONVERSATION_AND_ARCHIVES),
+    (53, V53__LEARNING_PROPOSALS),
+    (54, V54__PLUGIN_INSTALLATIONS),
 ]
 
 
@@ -1294,4 +1741,5 @@ CREATE INDEX idx_audit_action ON audit_logs(action, seq);
 
 PROFILE_MIGRATIONS: list[tuple[int, str]] = [
     (1, PROFILE_V1),
+    (2, PROFILE_V2__SKILL_STAGING_AND_VERSIONS),
 ]

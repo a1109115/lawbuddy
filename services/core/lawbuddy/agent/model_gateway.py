@@ -24,7 +24,7 @@ from collections.abc import Callable, Iterator
 from http.client import IncompleteRead
 from typing import Any
 
-from . import model_protocol, model_registry
+from . import model_protocol, model_registry, stream_watchdog
 from .tasks import get_setting
 
 # ---- 服务商（model_registry：内置官方预设 + 用户自定义，运行时可扩展） ----
@@ -106,11 +106,24 @@ STREAM_MIN_INTERVAL_S = 0.5
 
 
 class ModelGatewayError(RuntimeError):
-    pass
+    """模型网关错误基类。
+
+    `category` 为统一错误类别（WP02），供重试、事件与 Span 共用；未显式分类
+    时由 `error_classifier` 按异常类型推断，保证 UI 拿到同一套语义。
+    """
+
+    category = "provider_unavailable"
+
+    def __init__(self, message: str = "", *, category: str | None = None):
+        super().__init__(message)
+        if category:
+            self.category = category
 
 
 class ModelNotConfigured(ModelGatewayError):
     """未配置 API Key：调用方应降级为本地分析并提示。"""
+
+    category = "auth"
 
 
 class ModelAuthError(ModelGatewayError):
@@ -118,6 +131,8 @@ class ModelAuthError(ModelGatewayError):
 
     调用方应终止任务并引导用户更新 API Key（更新后重新发起可从检查点续跑）。
     """
+
+    category = "auth"
 
 
 class ModelBadRequest(ModelGatewayError):
@@ -127,9 +142,11 @@ class ModelBadRequest(ModelGatewayError):
     调用方据此改派档位重试，而不是误判成 JSON mode 的问题。
     """
 
+    category = "invalid_request"
+
     def __init__(self, message: str, *, reasoning_rejected: bool = False,
-                 allowed_efforts: list[str] | None = None):
-        super().__init__(message)
+                 allowed_efforts: list[str] | None = None, category: str | None = None):
+        super().__init__(message, category=category)
         self.reasoning_rejected = reasoning_rejected
         self.allowed_efforts = list(allowed_efforts or [])
 
@@ -137,9 +154,18 @@ class ModelBadRequest(ModelGatewayError):
 class StreamInterrupted(ModelGatewayError):
     """流式响应中断（FR-002）：已接收文本保留在 received，内容不完整。"""
 
-    def __init__(self, received: str, reason: str):
-        super().__init__(f"流式响应中断（{reason}）")
+    category = "disconnect"
+
+    def __init__(self, received: str, reason: str, *, resumable: bool = False,
+                 partial_tool_calls: int = 0, category: str | None = None):
+        super().__init__(f"流式响应中断（{reason}）", category=category)
         self.received = received
+        # 是否可"续写"（P2-10）：仅中途断连（已收到正文、无工具调用）时可续写；
+        # 首字前断连由传输层重试处理，不进入续写路径。
+        self.resumable = resumable
+        # 断连时已收到的**不完整**工具调用帧数（参数未收全）。调用方必须丢弃这些
+        # 调用、不得按缺参执行；>0 表示本轮应按"整轮重试"处理而不是续写正文。
+        self.partial_tool_calls = int(partial_tool_calls or 0)
 
 
 class ReasoningRunaway(ModelGatewayError):
@@ -150,8 +176,13 @@ class ReasoningRunaway(ModelGatewayError):
     正常深度思考极少超过 1 万 token；熔断后调用方可降档立即重试，不必等烧满。
     """
 
+    category = "format"
+
     def __init__(self, reasoning_chars: int):
-        super().__init__(f"模型思考失控（已思考 {reasoning_chars} 字仍无输出），已提前中断")
+        super().__init__(
+            f"模型思考失控（已思考 {reasoning_chars} 字仍无输出），已提前中断",
+            category="format",
+        )
         self.reasoning_chars = reasoning_chars
 
 
@@ -180,13 +211,22 @@ def _retry_delay(attempt: int) -> float:
 
 
 def _http_error_exception(exc: urllib.error.HTTPError) -> ModelGatewayError:
-    """把 HTTPError 转成可展示的网关异常（读一次响应体，避免重复消费）。"""
-    if exc.code in (401, 403):
-        return ModelAuthError(
-            f"API Key 无效或无权限（HTTP {exc.code}）：{_http_error_detail(exc)}；"
-            "请在「模型 API Key」设置中更新或清除后重新发起任务"
-        )
+    """把 HTTPError 转成可展示的网关异常（读一次响应体，避免重复消费）。
+
+    分类依据 `error_classifier`（WP02）：401 → auth，402 → billing，
+    403 → permission（欠费文案除外），413/超长 400 → context_overflow，
+    429 → rate_limit，400 → invalid_request，5xx → provider_unavailable。
+    """
+    from . import error_classifier
+
     detail = _http_error_detail(exc)
+    category = error_classifier.classify(exc, status=int(exc.code), detail=detail)
+    if category in (error_classifier.AUTH, error_classifier.PERMISSION):
+        return ModelAuthError(
+            f"API Key 无效或无权限（HTTP {exc.code}）：{detail}；"
+            "请在「模型 API Key」设置中更新或清除后重新发起任务",
+            category=category,
+        )
     if exc.code == 400:
         hint = _vision_unsupported_hint(detail)
         allowed = _allowed_efforts_from_detail(detail)
@@ -194,8 +234,9 @@ def _http_error_exception(exc: urllib.error.HTTPError) -> ModelGatewayError:
             f"{detail}{hint}" if hint else detail,
             reasoning_rejected=bool(allowed),
             allowed_efforts=allowed,
+            category=category,
         )
-    return ModelGatewayError(detail)
+    return ModelGatewayError(detail, category=category)
 
 
 def _raise_http_error(exc: urllib.error.HTTPError) -> None:
@@ -825,6 +866,12 @@ class ChatStream:
                 json_mode=self._json_mode and bool(_provider_conf(self._model).get("jsonMode")),
             )
             req = _request(body, self._model)
+            watchdog = stream_watchdog.StreamWatchdog(
+                first_token_s=self._stream_timeout,
+                idle_s=self._stream_timeout,
+                total_s=READ_STREAM_TIMEOUT_S,
+                cancel_check=self._cancel_check,
+            )
             try:
                 with urllib.request.urlopen(
                     req, timeout=self._stream_timeout, context=ssl.create_default_context()
@@ -835,6 +882,17 @@ class ChatStream:
                             from .tasks import TaskCancelled
 
                             raise TaskCancelled("用户停止")
+                        watchdog.tick(len(raw_line))
+                        stall = watchdog.expired()
+                        if stall in (
+                            stream_watchdog.REASON_IDLE, stream_watchdog.REASON_TOTAL,
+                        ):
+                            # 帧间静默 / 总时长超限：按可续写的流式中断处理，
+                            # 已接收正文保留，不把停滞当成正常结束。
+                            raise StreamInterrupted(
+                                "".join(received), stall,
+                                resumable=True, category="stale_stream",
+                            )
                         line = raw_line.decode("utf-8", errors="replace").strip()
                         if not line.startswith("data:"):
                             continue  # 忽略注释/心跳行
@@ -1154,6 +1212,10 @@ def chat_with_tools(
             tools=tools,
         )
         req = _request(body, model)
+        watchdog = stream_watchdog.StreamWatchdog(
+            first_token_s=STREAM_TIMEOUT_S, idle_s=STREAM_TIMEOUT_S,
+            total_s=READ_STREAM_TIMEOUT_S, cancel_check=cancel_check,
+        )
         try:
             with urllib.request.urlopen(req, timeout=STREAM_TIMEOUT_S, context=ssl.create_default_context()) as resp:
                 for raw_line in resp:
@@ -1161,6 +1223,19 @@ def chat_with_tools(
                         from .tasks import TaskCancelled
 
                         raise TaskCancelled("用户停止")
+                    watchdog.tick(len(raw_line))
+                    stall = watchdog.expired()
+                    if stall in (
+                        stream_watchdog.REASON_IDLE, stream_watchdog.REASON_TOTAL,
+                    ):
+                        # 工具调用轮：停滞时若已开始接收参数但未收全，绝不执行；
+                        # 已收正文且无工具调用时可续写（HAR-T-009）。
+                        raise StreamInterrupted(
+                            "".join(received), stall,
+                            resumable=bool(received) and not calls_by_index,
+                            partial_tool_calls=len(calls_by_index),
+                            category="stale_stream",
+                        )
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line.startswith("data:"):
                         continue
@@ -1270,7 +1345,15 @@ def chat_with_tools(
                 time.sleep(_retry_delay(attempt))
                 attempt += 1
                 continue
-            raise StreamInterrupted("".join(received), type(exc).__name__) from exc
+            # 中途断连（P2-10 §4.7）：已收到正文且无工具调用时标记为可续写，
+            # 由调用方携带已生成部分请求"继续写"，而不是整轮丢弃重来。
+            # 已开始接收工具调用帧但参数未收全时：不执行、不续写，整轮重试
+            # （HAR-T-009：不允许把不完整参数当成完整调用执行）。
+            raise StreamInterrupted(
+                "".join(received), type(exc).__name__,
+                resumable=bool(received) and not calls_by_index,
+                partial_tool_calls=len(calls_by_index),
+            ) from exc
 
     usage_final = usage if usage_raw else {
         "promptTokens": 0,

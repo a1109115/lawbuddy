@@ -41,12 +41,19 @@ GATE_WORKFLOWS = 4
 
 # 阅卷路径允许出现的事件类型：
 # - LOOP_EVENT_TYPES：6 种循环协议事件（UI 唯一消费面）
+# - DELIVERY_EVENT_TYPES：交付与 Harness 进度事件（LB-HARNESS-2026-01 B-05：
+#   交付骨架/收尾/工作单元进度/产物提交/预算阶段/恢复），只含计数与状态，
+#   不含案件原文；UI 已消费这些事件做真实进度展示
 # - CONTROL_EVENT_TYPES：控制面事件（status=生命周期变更必现；resume=断点续跑时出现；
 #   answer_verification=收尾引用校验结果，前端角标数据源）
 # error / message / plan / tool_call / budget / model_call 等旧协议或异常事件健康运行不得出现
 LOOP_EVENT_TYPES = {
     "text", "tool_use_start", "tool_use_done",
     "assistant_message", "tool_result_message", "turn_complete",
+}
+DELIVERY_EVENT_TYPES = {
+    "deliverable_skeleton", "deliverable_wrap_up", "work_unit_update",
+    "artifact_commit", "budget_update", "run_recovered",
 }
 CONTROL_EVENT_TYPES = {"status", "resume", "answer_verification"}
 
@@ -233,6 +240,73 @@ def _decomposed_retrieval(case_id: str) -> dict[str, Any]:
     }
 
 
+def _retrieval_robustness(case_id: str) -> dict[str, Any]:
+    """检索鲁棒性（本次修复的行为门禁）。
+
+    卷宗类任务的两个真实失效模式：
+    1) 查询串多词且原文并非逐字相邻时，整串短语落空——原文写
+       `“Material Adverse Effect” means`、`acts of God`，按自然写法却搜不到；
+       短语无命中时必须能退回分词匹配。
+    2) 多份同类材料混排时，全局 BM25 只覆盖少数几份，其余材料看起来「没有」；
+       必须能按文档补齐覆盖，或支持把检索限定在指定材料内。
+
+    这里不假设语料内容：先从本案真实页面里找出「两个词同页但不相邻」的组合，
+    再验证该组合的短语查询走不通、分词查询能通。
+    """
+    from lawbuddy.documents import list_documents
+    from lawbuddy.search import search_pages
+
+    docs = list_documents(case_id)
+    titles = [d["title"] for d in docs]
+
+    # 1) 短语兜底：找「纯短语 0 命中、分词后仍有命中」的真实组合。
+    #    直接用底层表达式验证，避免把兜底逻辑本身当成被测对象。
+    from lawbuddy.search import _fts_query, _phrase_expr, _token_expr
+
+    candidates = [("工程保证金", "转账记录"), ("工程保证金", "银行流水"),
+                  ("合同诈骗", "量刑建议"), ("取保候审", "保证人")]
+    probe = ""
+    phrase_hits = token_hits = 0
+    for a, b in candidates:
+        combined = f"{a} {b}"
+        exact = _fts_query([case_id], _phrase_expr(combined), 5)
+        token = _token_expr(combined)
+        if exact or not token:
+            continue  # 整串已能命中，说明原文逐字相邻，不构成本场景
+        fallback = _fts_query([case_id], token, 5)
+        if fallback:
+            probe = combined
+            phrase_hits, token_hits = len(exact), len(fallback)
+            break
+    phrase_fallback_ok = bool(probe) and phrase_hits == 0 and token_hits > 0
+
+    # 2) 文档覆盖：限定检索必须能逐份命中，且不越出指定材料
+    target = "工程保证金"
+    covered_all = {h["documentTitle"] for h in search_pages(case_id, target, limit=50)}
+    per_doc_hit = 0
+    for d in docs:
+        hits = search_pages(case_id, target, limit=3, document_ids=(d["id"],))
+        if hits and all(h["documentTitle"] == d["title"] for h in hits):
+            per_doc_hit += 1
+    scoped_only_ok = per_doc_hit >= 1
+
+    sample = docs[0]
+    scoped = search_pages(case_id, target, limit=5, document_ids=(sample["id"],))
+    scope_respected = all(h["documentTitle"] == sample["title"] for h in scoped)
+
+    return {
+        "phraseFallbackOk": phrase_fallback_ok,
+        "probe": probe,
+        "phraseHits": phrase_hits,
+        "tokenHits": token_hits,
+        "documents": len(titles),
+        "coveredDocuments": len(covered_all),
+        "perDocumentHit": per_doc_hit,
+        "scopedOnlyOk": scoped_only_ok,
+        "scopeRespected": scope_respected,
+    }
+
+
 def run_baseline(case_dir: Path, keep: bool = False) -> dict[str, Any]:
     from lawbuddy.workspace import ensure_workspace
     from lawbuddy.cases import create_case
@@ -345,8 +419,12 @@ def run_baseline(case_dir: Path, keep: bool = False) -> dict[str, Any]:
             assistant = [e for e in loop_events if e["type"] == "assistant_message"]
             answer = str(assistant[-1]["payload"].get("content") or "") if assistant else ""
             protocol = {
-                # 事件类型白名单（健康运行不得出现 message/error 等旧协议或异常事件）
-                "eventWhitelist": all(e["type"] in LOOP_EVENT_TYPES | CONTROL_EVENT_TYPES for e in events),
+                # 事件类型白名单（健康运行不得出现 message/error 等旧协议或异常事件；
+                # 交付/Harness 进度事件属于既定协议，见 DELIVERY_EVENT_TYPES）
+                "eventWhitelist": all(
+                    e["type"] in LOOP_EVENT_TYPES | DELIVERY_EVENT_TYPES | CONTROL_EVENT_TYPES
+                    for e in events
+                ),
                 # 工具闭环：每个 tool_use_start 都有同 callId 的 tool_use_done 且状态 ok
                 "toolClosedLoop": sorted(starts) == sorted(d["payload"].get("callId") for d in dones)
                                   and all(d["payload"].get("status") == "ok" for d in dones),
@@ -394,8 +472,12 @@ def run_baseline(case_dir: Path, keep: bool = False) -> dict[str, Any]:
             "ftsIndexedPages": fts_pages,
         }
 
+        # ---- 5) 检索鲁棒性（短语兜底 / 文档覆盖 / 限定检索） ----
+        report["retrievalRobustness"] = _retrieval_robustness(case_id)
+
         # ---- 6) 门槛判定（引证统计不设门：阅卷路径不产 Claim） ----
         dec = report["decomposedRetrieval"]
+        rob = report["retrievalRobustness"]
         gates = {
             "import100": report["import"]["successRate"] >= GATE_IMPORT_RATE,
             "parties100": report["parties"]["coverage"] >= GATE_PARTY_RATE,
@@ -412,6 +494,10 @@ def run_baseline(case_dir: Path, keep: bool = False) -> dict[str, Any]:
             # D5：多概念问句整串短语必落空，拆词后必须能召回（拆解的不可替代价值）
             "compoundQueryNeedsSplit": dec["compound"]["multiHit"] > dec["compound"]["singleHit"],
             "decomposedToolWired": dec["toolQueriesOk"] and dec["legacyQueryOk"],
+            # 短语自然写法（带引号/多词）必须仍能召回，不能因标点差异整串落空
+            "phraseFallbackWorks": rob["phraseFallbackOk"],
+            # 限定材料检索必须真的限定，且能逐份命中
+            "scopedSearchWorks": rob["scopeRespected"] and rob["scopedOnlyOk"],
         }
         report["gates"] = gates
         report["passed"] = all(gates.values())
@@ -461,6 +547,11 @@ def _print_summary(r: dict[str, Any]) -> None:
             elif row["multiRank"] is not None and row["singleRank"] is not None \
                     and row["multiRank"] > row["singleRank"]:
                 print(f"  ! 拆解后位次变差：『{row['query']}』{row['singleRank']} → {row['multiRank']}")
+    rob = r.get("retrievalRobustness") or {}
+    if rob:
+        print(f"检索鲁棒性：『{rob['probe']}』整串短语 {rob['phraseHits']} 命中"
+              f" → 分词 {rob['tokenHits']} 命中；全案覆盖 {rob['coveredDocuments']}/{rob['documents']} 份材料，"
+              f"限定检索逐份命中 {rob['perDocumentHit']}/{rob['documents']} 份")
     wf = r["workflows"]
     print(f"阅卷 E2E：{wf['completed']}/4 完成，{wf['protocolOk']}/4 事件协议不变量通过")
     for row in wf["rows"]:

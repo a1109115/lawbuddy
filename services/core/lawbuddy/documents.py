@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import os
@@ -72,6 +73,11 @@ KIND_MIME = {
 }
 
 # 文本后缀 → kind（内容已确认可解码为文本后使用）
+# 纯文本分页阈值：目标页长与单页上限。纯文本没有物理页，按段落累积到目标
+# 页长切分，使检索定位、分页读取和引用页码与 PDF/DOCX 行为一致。
+_PLAIN_PAGE_CHARS = 3200
+_PLAIN_PAGE_MAX_CHARS = 6000
+
 _TEXT_SUFFIX_KINDS = {
     ".md": "md",
     ".markdown": "md",
@@ -121,12 +127,15 @@ def _decode_text_prefix(path: Path, limit: int = 8192) -> str | None:
     if not raw:
         return ""
     try:
-        text = raw.decode("utf-8-sig")
+        # 只读文件头，末尾很可能截断在多字节字符中间。增量解码器保留不完整
+        # 的尾字节而不是报错，否则合法 UTF-8 文本会被整份判成二进制丢弃
+        # （实测 16 份合同丢掉 1 份、facts.md 被拒收）。
+        text = codecs.getincrementaldecoder("utf-8-sig")().decode(raw, final=False)
     except UnicodeDecodeError:
         if path.suffix.lower() not in _TEXT_SUFFIX_KINDS and path.suffix.lower() not in ("", ".txt"):
             return None
         try:
-            text = raw.decode("gb18030")
+            text = codecs.getincrementaldecoder("gb18030")().decode(raw, final=False)
         except UnicodeDecodeError:
             return None
     printable = sum(1 for ch in text if ch.isprintable() or ch in "\r\n\t")
@@ -224,12 +233,31 @@ def _blob_path(root: Path, sha: str) -> Path:
 
 
 def _store_blob(root: Path, src: Path, sha: str) -> str:
-    """原件加密写入内容存储；同哈希物理复用，文件设为只读。"""
+    """原件加密写入内容存储；同哈希物理复用，文件设为只读。
+
+    复用前校验既有 blob 能否被当前 DEK 解开（P2-11）：工作空间重建后同名
+    原件的旧 blob 仍在盘上但密钥已换，直接复用会让"重新导入"继续失败。
+    这里用可解性作为复用条件，替换时先清只读属性再原子覆盖。
+    """
     dst = _blob_path(root, sha)
-    if not dst.exists():
+    reusable = dst.exists()
+    if reusable:
+        try:
+            from .blobstore import diagnose_blob
+
+            rel = str(dst.relative_to(root)).replace("\\", "/")
+            reusable = bool(diagnose_blob(root, rel).get("ok"))
+        except Exception:
+            reusable = False
+    if not reusable:
         dst.parent.mkdir(parents=True, exist_ok=True)
         tmp = dst.with_suffix(".tmp")
         crypto.encrypt_file(src, tmp, crypto.derive_file_key(get_active_dek()))
+        if dst.exists():
+            try:
+                os.chmod(dst, 0o666)  # 旧只读 blob：先放开写权限再覆盖
+            except OSError:
+                pass
         os.replace(tmp, dst)
         os.chmod(dst, 0o444)  # 原件只读（Windows 下同样生效为只读属性）
     return f"{BLOB_DIRNAME}/{sha[:2]}/{sha}"
@@ -494,9 +522,53 @@ def _read_text_any(blob: Path) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def _split_plain_pages(text: str) -> list[tuple[str, str]]:
+    """把纯文本按段落切成近似页。
+
+    纯文本没有物理页，但下游（检索定位、分页读取、引用页码）都按页工作。
+    若整份合同作为「1 页」入库，几十万字的协议既无法按页命中，也无法在
+    单次回灌上限内读完——模型只能靠反复全文检索，实际读不到完整条款。
+    这里按段落累积到目标页长切分，超长段落再硬切，保证每页都在读取上限内。
+    """
+    text = text.strip()
+    if not text:
+        return [("", "empty")]
+    if len(text) <= _PLAIN_PAGE_MAX_CHARS:
+        return [(text, "native")]
+    pages: list[tuple[str, str]] = []
+    buf: list[str] = []
+    size = 0
+
+    def flush() -> None:
+        nonlocal buf, size
+        chunk = "\n\n".join(buf).strip()
+        if chunk:
+            pages.append((chunk, "native"))
+        buf = []
+        size = 0
+
+    for para in text.split("\n\n"):
+        para = para.strip("\n")
+        if not para:
+            continue
+        if len(para) > _PLAIN_PAGE_MAX_CHARS:
+            flush()
+            for i in range(0, len(para), _PLAIN_PAGE_CHARS):
+                seg = para[i:i + _PLAIN_PAGE_CHARS].strip()
+                if seg:
+                    pages.append((seg, "native"))
+            continue
+        if size and size + len(para) + 2 > _PLAIN_PAGE_CHARS:
+            flush()
+        buf.append(para)
+        size += len(para) + 2
+    flush()
+    return pages or [("", "empty")]
+
+
 def _extract_plain(blob: Path) -> tuple[list[tuple[str, str]], str]:
     text = _read_text_any(blob).strip()
-    return ([(text, "native")] if text else [("", "empty")]), "ready"
+    return _split_plain_pages(text), "ready"
 
 
 # HTML 结构标签：作为换行处理，保留段落边界（供阅读与检索定位）
@@ -856,10 +928,17 @@ def import_documents(case_id: str, paths: list[str]) -> list[dict[str, Any]]:
                                 "reason": str(exc)})
                 continue
             except Exception as exc:  # 解析失败保留原件，标记 failed（可重试）
+                # 密钥不匹配（P2-11）：工作空间重建/内容目录被替换后旧 blob 无法
+                # 用当前 DEK 解开。此前统一报"解析失败，可稍后重试"会让用户反复
+                # 重试无效；这里明确区分并引导重新导入，且绝不降级为明文读取。
+                from .blobstore import is_dek_mismatch, mismatch_hint
+
+                dek_mismatch = is_dek_mismatch(exc)
+                reason = mismatch_hint() if dek_mismatch else "文件解析失败，原件已保存，可稍后重试"
                 with db.transaction() as conn:
                     conn.execute(
                         "UPDATE document_versions SET parse_status = 'failed', error_text = ? WHERE id = ?",
-                        (f"{type(exc).__name__}: {exc}", version_id),
+                        (reason if dek_mismatch else f"{type(exc).__name__}: {exc}", version_id),
                     )
                     conn.execute(
                         "UPDATE documents SET status = 'failed', updated_at = ? WHERE id = ?",
@@ -873,10 +952,11 @@ def import_documents(case_id: str, paths: list[str]) -> list[dict[str, Any]]:
                         case_id=case_id,
                         result="failed",
                         metadata={"fileName": src.name, "kind": kind, "sha256": sha[:12],
-                                  "reason": f"parse failed: {type(exc).__name__}"},
+                                  "reason": "blob_dek_mismatch" if dek_mismatch
+                                  else f"parse failed: {type(exc).__name__}"},
                     )
                 results.append({"name": src.name, "status": "failed", "documentId": doc_id,
-                                "reason": "文件解析失败，原件已保存，可稍后重试"})
+                                "reason": reason})
                 continue
 
             results.append({

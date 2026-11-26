@@ -393,6 +393,100 @@ def _run_injection(report: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
 
 
 # ---------------------------------------------------------------------------
+# 段 7：原件区只读隔离（P1-06，WFA-LAW §4.4）
+# ---------------------------------------------------------------------------
+
+def _run_readonly_zones(report: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+    """bash / 文件工具不得直读原件区，工作区读写不受影响，拦截有审计。
+
+    原件区（inputs/）与内容存储（blobs/）、内部目录（.lawbuddy/）只能经文档管线
+    访问：直读会绕过分页、引用回查与 OCR 置信度校验，使"每条结论可回溯原文"
+    的硬门禁失效。本段验证拒绝率 100%、工作区不受影响、白名单按任务生效。
+    """
+    from lawbuddy import sandbox
+
+    rows: list[dict[str, Any]] = []
+    root = _workspace_root()
+
+    inputs = root / "inputs"
+    work = root / "work"
+    inputs.mkdir(parents=True, exist_ok=True)
+    work.mkdir(parents=True, exist_ok=True)
+    sample = inputs / "agreement-a.txt"
+    sample.write_text("原件样本：MAE 定义见第 3 条。", encoding="utf-8")
+    workspace_file = work / "notes.md"
+    workspace_file.write_text("工作区笔记", encoding="utf-8")
+
+    state = {"task_id": "eval-task", "case_id": "eval-case", "tool_policy": {}}
+
+    # 1) read_file 直读原件区一律拒绝
+    try:
+        sandbox.read_file(root, "inputs/agreement-a.txt", 1, 50, state)
+        rows.append({"step": "readFileInputsRejected", "ok": False})
+    except ValueError as exc:
+        rows.append({"step": "readFileInputsRejected", "ok": "只读原件区" in str(exc)})
+
+    # 2) 工作区读取不受影响
+    out = sandbox.read_file(root, "work/notes.md", 1, 50, state)
+    rows.append({"step": "readFileWorkAllowed", "ok": "工作区笔记" in out.get("content", "")})
+
+    # 3) 原件区写入拒绝（原件只读是产品硬约束）
+    try:
+        sandbox.write_file(root, "inputs/agreement-a.txt", "被篡改")
+        rows.append({"step": "writeFileInputsRejected", "ok": False})
+    except ValueError:
+        rows.append({"step": "writeFileInputsRejected",
+                     "ok": sample.read_text(encoding="utf-8").startswith("原件样本")})
+
+    # 4) 工作区写入正常
+    sandbox.write_file(root, "work/out.csv", "a,b\n1,2\n")
+    rows.append({"step": "writeFileWorkAllowed", "ok": (work / "out.csv").exists()})
+
+    # 5) glob / grep 不返回原件区文件
+    g = sandbox.glob_files(root, "**/*.txt", ".", state)
+    paths = [e["path"] for e in g.get("entries", [])]
+    rows.append({"step": "globHidesInputs", "ok": not any(p.startswith("inputs/") for p in paths)})
+    gr = sandbox.grep_search(root, "MAE", ".", "*.txt", state=state)
+    files = [m["file"] for m in gr.get("matches", [])]
+    rows.append({"step": "grepHidesInputs", "ok": not any(f.startswith("inputs/") for f in files)})
+
+    # 6) bash 命令引用原件区即拒绝（工作区命令放行）
+    for bad in ("cat inputs/agreement-a.txt", 'type "inputs/agreement-a.txt"', "cd inputs && ls"):
+        try:
+            sandbox._guard_bash_command(root, bad, state)
+            rows.append({"step": "bashInputsRejected", "ok": False, "command": bad})
+            break
+        except ValueError:
+            continue
+    else:
+        rows.append({"step": "bashInputsRejected", "ok": True})
+    sandbox._guard_bash_command(root, "python work/script.py", state)
+    rows.append({"step": "bashWorkAllowed", "ok": True})
+
+    # 7) 显式白名单（任务级 allowReadPaths）只放宽读取，且不放行密钥目录
+    allowed_state = dict(state, tool_policy={"allowReadPaths": ["inputs/agreement-a.txt"]})
+    widened = sandbox.read_file(root, "inputs/agreement-a.txt", 1, 50, allowed_state)
+    rows.append({"step": "allowReadPathsOptIn", "ok": "原件样本" in widened.get("content", "")})
+    key_state = dict(state, tool_policy={"allowReadPaths": [".lawbuddy/dek.key"]})
+    rows.append({"step": "allowReadPathsNeverCoversKeys",
+                 "ok": sandbox._allow_read_paths(key_state) == []})
+
+    # 8) 拦截写入审计（只记路径与动作）
+    from lawbuddy.storage import get_db
+
+    hits = get_db().query(
+        "SELECT metadata_json FROM audit_logs WHERE action = 'sandbox.readonly_blocked'"
+    )
+    metas = [json.loads(r["metadata_json"] or "{}") for r in hits]
+    rows.append({"step": "blockedAudited", "ok": bool(metas)
+                 and all("path" in m and "content" not in m for m in metas)})
+
+    report["readonlyZones"] = {"blockedEvents": len(metas)}
+    ok = all(r["ok"] for r in rows)
+    return rows, ok
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
@@ -417,6 +511,7 @@ def run_eval(keep: bool = False) -> dict[str, Any]:
         g4 = _seg(report, "electronStatic", _run_electron_static)
         g5 = _seg(report, "secretsLogs", _run_secrets_logs)
         g6 = _seg(report, "injection", _run_injection)
+        g7 = _seg(report, "readonlyZones", _run_readonly_zones)
 
         gates = {
             "permissionDefaultsS001S002": g1,
@@ -425,6 +520,7 @@ def run_eval(keep: bool = False) -> dict[str, Any]:
             "electronIsolationS006S007": g4,
             "secretsAndLogsS009S010": g5,
             "visualInjectionS014": g6,
+            "readonlyZonesP106": g7,
         }
         report["gates"] = gates
         report["passed"] = all(gates.values())
@@ -439,7 +535,8 @@ def _print_summary(r: dict[str, Any]) -> None:
     print(f"\n=== M3 评测 · 权限、安全与隐私（{r['mode']}） ===")
     for seg, title in (("permissions", "权限默认与授权粒度(S-001/S-002)"), ("approval", "审批卡与参数替换(S-003/S-004)"),
                        ("pathSafety", "路径逃逸(S-005)"), ("electronStatic", "Electron 隔离与导航(S-006/S-007)"),
-                       ("secretsLogs", "密钥与日志(S-009/S-010)"), ("injection", "可视化注入(S-014)")):
+                       ("secretsLogs", "密钥与日志(S-009/S-010)"), ("injection", "可视化注入(S-014)"),
+                       ("readonlyZones", "原件区只读隔离(P1-06)")):
         entry = r.get(seg, {})
         print(f"{title}：{'通过' if entry.get('ok') else '未通过'}")
         for row in entry.get("rows", []):

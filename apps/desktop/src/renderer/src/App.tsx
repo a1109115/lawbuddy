@@ -6,11 +6,16 @@ import { ApiKeyDialog } from './components/ApiKeyDialog'
 import { AuditDialog } from './components/AuditDialog'
 import { ClaimsQueueDialog } from './components/ClaimsQueueDialog'
 import { ContractStartDialog } from './components/ContractStartDialog'
+import { ConversationDialog } from './components/ConversationDialog'
 import { DeleteCaseDialog } from './components/DeleteCaseDialog'
 import { DocGenStartDialog } from './components/DocGenStartDialog'
+import { LearningDialog } from './components/LearningDialog'
+import { ModelHealthDialog } from './components/ModelHealthDialog'
 import { NewCaseDialog } from './components/NewCaseDialog'
+import { PluginDialog } from './components/PluginDialog'
 import { SkillDialog } from './components/SkillDialog'
 import { MemoryDialog } from './components/MemoryDialog'
+import { RecoveryDialog } from './components/RecoveryDialog'
 import { RedactionDialog } from './components/RedactionDialog'
 import { StrategyStartDialog } from './components/StrategyStartDialog'
 import { RightPanel } from './components/RightPanel'
@@ -78,6 +83,11 @@ export default function App(): JSX.Element {
         else if (s.creatingCase) s.setCreatingCase(false)
         else if (s.deletingCase) s.setDeletingCase(null)
         else if (s.claimsQueueOpen) s.setClaimsQueueOpen(false)
+        else if (s.conversationOpen) s.setConversationOpen(false)
+        else if (s.learningOpen) s.setLearningOpen(false)
+        else if (s.pluginOpen) s.setPluginOpen(false)
+        else if (s.modelHealthOpen) s.setModelHealthOpen(false)
+        else if (s.recoveryOpen) s.setRecoveryOpen(false)
         else if (s.auditOpen) s.setAuditOpen(false)
         else if (s.apiKeyDialogOpen) s.setApiKeyDialogOpen(false)
         else if (s.unlockTarget) s.closeUnlock()
@@ -128,6 +138,11 @@ export default function App(): JSX.Element {
       <RedactionDialog />
       <SkillDialog />
       <MemoryDialog />
+      <RecoveryDialog />
+      <ConversationDialog />
+      <LearningDialog />
+      <PluginDialog />
+      <ModelHealthDialog />
       <ContractStartDialog />
       <StrategyStartDialog />
       <DocGenStartDialog />

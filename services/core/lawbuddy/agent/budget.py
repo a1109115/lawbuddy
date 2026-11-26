@@ -15,6 +15,7 @@ token maxTokens。
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any
 
 from ..storage import get_db
@@ -112,6 +113,22 @@ def snapshot(task_id: str) -> dict[str, Any]:
         "used": json.loads(row["used_json"] or "{}"),
         "reasons": json.loads(row["reasons_json"] or "[]"),
         "noProgressRounds": int(row["no_progress_rounds"] or 0),
+    }
+
+
+# 可对外展示的预算计数：`calls` 里存的是「工具名|参数摘要」，参数可能含查询词或
+# 文件路径，不能进入事件 payload、UI 或评测报告（方案 §2.1 第 5 条）。
+PUBLIC_USED_KEYS = (
+    "round", "model_call", "tool_call", "tokens", "subagent_round", "startedAt",
+    "exploreRounds", "deliveryReservedRounds",
+)
+
+
+def public_used(used: dict[str, Any] | None) -> dict[str, Any]:
+    """过滤预算已用量，只保留数值计数与时间，不返回工具参数摘要。"""
+    return {
+        key: value for key, value in (used or {}).items()
+        if key in PUBLIC_USED_KEYS and isinstance(value, (int, float, str))
     }
 
 
@@ -254,3 +271,175 @@ def note_progress(task_id: str, *, claims_added: int, evidence_added: int) -> st
 def blocked_reason(task_id: str) -> str:
     snap = snapshot(task_id)
     return "；".join(snap.get("reasons") or []) or "任务预算已耗尽"
+
+
+# ---------------------------------------------------------------------------
+# 共享预算预留（WP07）：主/子 Agent 原子「预留—结算—释放」
+# ---------------------------------------------------------------------------
+
+# 预留资源 → 对应的 used 计数键（结算时写回同一计数）
+_RESOURCE_USED_KEY = {
+    "round": "round",
+    "tool_call": "tool_call",
+    "model_call": "model_call",
+    "prompt_token": "tokens",
+    "completion_token": "tokens",
+    "wall_ms": None,  # 墙钟由 startedAt 推导，不做预留结算
+}
+
+
+class ReservationDenied(BudgetExceeded):
+    """预留被拒绝：已用量 + 其他在途预留会超出上限（并发逃逸保护）。"""
+
+
+def _reserved_total(task_id: str, resource: str) -> int:
+    row = get_db().query_one(
+        "SELECT COALESCE(SUM(amount - spent), 0) AS c FROM task_budget_reservations "
+        "WHERE task_id = ? AND resource = ? AND status = 'reserved'",
+        (task_id, resource),
+    )
+    return int((row or {}).get("c") or 0)
+
+
+def reserve(
+    task_id: str, resource: str, amount: int = 1, *,
+    owner_id: str, subagent_id: str | None = None,
+) -> dict[str, Any]:
+    """原子预留一份预算。
+
+    判据是「已用 + 所有在途预留」，而不是只看已用：否则两个并发子代理各自
+    通过检查、合起来超限，就是典型的预算逃逸（WP07 硬约束）。
+    检查与插入在同一事务内完成，避免检查-插入竞态。
+    """
+    if resource not in _RESOURCE_USED_KEY:
+        raise ValueError(f"未知预算资源：{resource}")
+    amount = max(0, int(amount))
+    db = get_db()
+    ensure(task_id)
+    snap = snapshot(task_id)
+    limits = snap["limits"] or dict(DEFAULT_LIMITS)
+    used = snap["used"] or {}
+    limit_key = {
+        "round": "maxRounds", "tool_call": "maxToolCalls", "model_call": "maxModelCalls",
+        "prompt_token": "maxTokens", "completion_token": "maxTokens",
+    }.get(resource, "")
+    limit = int(limits.get(limit_key) or 0) if limit_key else 0
+    used_key = _RESOURCE_USED_KEY.get(resource)
+    already = int(used.get(used_key) or 0) if used_key else 0
+    reservation_id = str(uuid.uuid4())
+    ts = now_iso()
+    with db.transaction() as conn:
+        reserved_row = conn.execute(
+            "SELECT COALESCE(SUM(amount - spent), 0) AS c FROM task_budget_reservations "
+            "WHERE task_id = ? AND resource = ? AND status = 'reserved'",
+            (task_id, resource),
+        ).fetchone()
+        reserved = int((reserved_row or {"c": 0})["c"] or 0)
+        # wall_ms 不参与预留上限判定（墙钟是连续量，由 _evaluate 的 startedAt 推导）
+        if limit_key and limit > 0:
+            if amount <= 0:
+                raise ReservationDenied("预留量必须为正数")
+            if already + reserved + amount > limit:
+                raise ReservationDenied(
+                    f"{resource} 预留被拒绝：已用 {already} + 在途预留 "
+                    f"{reserved} + 本次 {amount} 超过上限 {limit}"
+                )
+        conn.execute(
+            """
+            INSERT INTO task_budget_reservations(
+                id, task_id, owner_id, subagent_id, resource, amount, unit, status,
+                spent, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', 0, ?, ?)
+            """,
+            (reservation_id, task_id, owner_id, subagent_id, resource, amount,
+             "token" if "token" in resource else ("ms" if resource == "wall_ms" else "count"),
+             ts, ts),
+        )
+    return {
+        "reservationId": reservation_id, "taskId": task_id, "resource": resource,
+        "amount": amount, "ownerId": owner_id, "subagentId": subagent_id,
+    }
+
+
+def settle(reservation_id: str, *, spent: int | None = None, tokens: int = 0) -> dict[str, Any]:
+    """结算预留：把预留量（或指定实际用量）写回 used 计数。
+
+    结算幂等：已结算的预留重复结算不会二次累加。
+    """
+    db = get_db()
+    row = db.query_one(
+        "SELECT * FROM task_budget_reservations WHERE id = ?", (reservation_id,)
+    )
+    if row is None:
+        raise ValueError("预留不存在")
+    if str(row["status"]) != "reserved":
+        return {"reservationId": reservation_id, "status": str(row["status"]), "applied": False}
+    resource = str(row["resource"])
+    actual = int(row["amount"] if spent is None else spent)
+    used_key = _RESOURCE_USED_KEY.get(resource)
+    ts = now_iso()
+    with db.transaction() as conn:
+        conn.execute(
+            "UPDATE task_budget_reservations SET status = 'settled', spent = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'reserved'",
+            (actual, ts, reservation_id),
+        )
+    if used_key and actual:
+        snap = snapshot(str(row["task_id"]))
+        limits = snap["limits"] or dict(DEFAULT_LIMITS)
+        used = dict(snap["used"] or {})
+        used.setdefault("startedAt", now_iso())
+        if resource in ("prompt_token", "completion_token"):
+            add = int(tokens or actual)
+            used["tokens"] = int(used.get("tokens") or 0) + add
+        else:
+            used[used_key] = int(used.get(used_key) or 0) + actual
+        stage, reasons = _evaluate(limits, used)
+        _save(str(row["task_id"]), used, stage, reasons)
+    return {
+        "reservationId": reservation_id, "status": "settled", "applied": True, "spent": actual,
+    }
+
+
+def release(reservation_id: str) -> dict[str, Any]:
+    """释放预留（调用失败或取消）：不写 used，只让额度可被其他子级复用。"""
+    db = get_db()
+    ts = now_iso()
+    with db.transaction() as conn:
+        cur = conn.execute(
+            "UPDATE task_budget_reservations SET status = 'released', updated_at = ? "
+            "WHERE id = ? AND status = 'reserved'",
+            (ts, reservation_id),
+        )
+        return {"reservationId": reservation_id, "status": "released", "applied": bool(cur.rowcount)}
+
+
+def release_owner(task_id: str, owner_id: str) -> int:
+    """释放某执行者的全部在途预留（子代理取消/超时传播时使用）。"""
+    db = get_db()
+    ts = now_iso()
+    with db.transaction() as conn:
+        cur = conn.execute(
+            "UPDATE task_budget_reservations SET status = 'released', updated_at = ? "
+            "WHERE task_id = ? AND owner_id = ? AND status = 'reserved'",
+            (ts, task_id, owner_id),
+        )
+        return int(cur.rowcount or 0)
+
+
+def reservations(task_id: str) -> dict[str, Any]:
+    """预留汇总（UI 与评测）：按状态与资源聚合，不返回参数或内容。"""
+    rows = get_db().query(
+        "SELECT resource, status, COUNT(*) AS c, COALESCE(SUM(amount),0) AS amount, "
+        "COALESCE(SUM(spent),0) AS spent FROM task_budget_reservations "
+        "WHERE task_id = ? GROUP BY resource, status",
+        (task_id,),
+    )
+    out: dict[str, Any] = {}
+    for r in rows:
+        key = f"{r['resource']}:{r['status']}"
+        out[key] = {"count": int(r["c"] or 0), "amount": int(r["amount"] or 0),
+                    "spent": int(r["spent"] or 0)}
+    return {"taskId": task_id, "byResource": out, "inflight": sum(
+        1 for r in rows if str(r["status"]) == "reserved"
+    )}

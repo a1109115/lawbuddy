@@ -404,9 +404,58 @@ function TaskMessage({
                     ))}
                   </ul>
                 )}
+                {/* 工作进度（B-05）：终态单元/总单元、已提交/待核实/阻塞、交付覆盖，数值来自账本 */}
+                {msg.turn.workProgress?.units && msg.turn.workProgress.units.total > 0 && (
+                  <span className="turn-progress">
+                    {' · '}
+                    工作单元 {msg.turn.workProgress.units.terminal}/{msg.turn.workProgress.units.total}
+                    {msg.turn.workProgress.cells && msg.turn.workProgress.cells.total > 0 && (
+                      <>
+                        {' · '}
+                        已提交 {msg.turn.workProgress.cells.committed}
+                        {' / '}待核实 {msg.turn.workProgress.cells.needsHuman}
+                        {msg.turn.workProgress.cells.blocked > 0 && (
+                          <> {' / '}阻塞 {msg.turn.workProgress.cells.blocked}</>
+                        )}
+                        {(msg.turn.workProgress.cells.stale ?? 0) > 0 && (
+                          <> {' / '}失效 {msg.turn.workProgress.cells.stale}</>
+                        )}
+                      </>
+                    )}
+                    {msg.turn.workProgress.delivery &&
+                      msg.turn.workProgress.delivery.artifactCount > 0 && (
+                        <>
+                          {' · '}交付 {msg.turn.workProgress.delivery.completeCount}/
+                          {msg.turn.workProgress.delivery.artifactCount} 文件
+                          {msg.turn.workProgress.delivery.status !== 'complete' && (
+                            <>
+                              （未全覆盖
+                              {msg.turn.workProgress.delivery.incomplete.length > 0
+                                ? `：${msg.turn.workProgress.delivery.incomplete
+                                    .slice(0, 3)
+                                    .join('、')}`
+                                : ''}
+                              ）
+                            </>
+                          )}
+                        </>
+                      )}
+                  </span>
+                )}
                 {/* 用时已在总折叠概览条展示，此处避免重复 */}
                 {!hasProcess && typeof msg.turn.durationMs === 'number' && (
                   <span> · 用时 {formatDuration(msg.turn.durationMs)}</span>
+                )}
+                {/* 预算进度（B-05）：已用轮次/上限与交付保留预算，数值来自任务预算表 */}
+                {msg.turn.budget && Number(msg.turn.budget.limits?.maxRounds ?? 0) > 0 && (
+                  <span className="turn-progress">
+                    {' · '}预算{' '}
+                    {Number(msg.turn.budget.used?.round ?? 0)}/
+                    {Number(msg.turn.budget.limits?.maxRounds)}
+                    {Number(msg.turn.budget.deliveryReservedRounds ?? 0) > 0 && (
+                      <>（交付保留 {Number(msg.turn.budget.deliveryReservedRounds)} 轮）</>
+                    )}
+                  </span>
                 )}
               </div>
             )}

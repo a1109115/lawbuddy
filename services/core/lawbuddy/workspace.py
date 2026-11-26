@@ -135,6 +135,20 @@ def ensure_workspace(
     return dict(row)
 
 
+def remove_workspace_dir(root: Path) -> dict[str, Any]:
+    """删除工作空间目录（P2-11）：先清只读属性，失败项汇总上报。
+
+    blob 落盘带只读属性，Windows 上直接 rmtree 会失败并留下半删目录；
+    "目录还在、库已删"会让下次打开进入不一致状态。这里按文件清属性后删除，
+    并把失败项返回给调用方（不静默忽略）。
+    """
+    from .blobstore import remove_tree
+
+    if not root.exists():
+        return {"removed": 0, "failed": []}
+    return remove_tree(root)
+
+
 def current_workspace_root() -> Path | None:
     """当前已打开工作空间的根目录；尚未初始化时返回 None。"""
     from .storage import get_db

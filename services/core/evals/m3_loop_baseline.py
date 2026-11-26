@@ -928,25 +928,35 @@ def _corpus_shape_rows() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     返回 (门槛行, 长页那次实测)，后者供续读成本口径复核。
     """
     from evals._loop_mock import ScriptStep
+    from lawbuddy.agent.autonomous import (
+        PAGE_TEXT_LIMIT, TOTAL_PAGE_READ_CHARS, _PAGE_ENTRY_OVERHEAD,
+    )
 
-    # 形态 1：单份材料单页超长（14,000 字）——必须多次游标续读才能读完
+    # 形态 1：单份材料单页超长——必须多次游标续读才能读完。
+    # 页长与游标偏移都按实现上限推算：单次回灌上限提高后，写死的页长会一次
+    # 读完，续读路径就测不到了。单次实际可读 == 总量上限 - 单页条目开销。
     base = "第一条 甲方杭州甲方向乙方上海乙方出售办公设备一批，总价人民币三十万元整。"
-    long_text = (base * 400)[:14000]
+    slice_len = max(1, min(PAGE_TEXT_LIMIT, TOTAL_PAGE_READ_CHARS - _PAGE_ENTRY_OVERHEAD))
+    per_call = TOTAL_PAGE_READ_CHARS - _PAGE_ENTRY_OVERHEAD
+    long_len = per_call * 2 + 1000
+    long_text = (base * ((long_len // len(base)) + 2))[:long_len]
+    offsets = [per_call, per_call * 2]
     case_long, ids_long = _seed_docs("M3评测-长页", {
         "long": ("长篇合同", {1: long_text}),
     })
-    long_row = _measure_steps(case_long["id"], "全卷阅卷：通读长篇合同", [
-        ScriptStep.tool("documents_list", {}),
-        ScriptStep.tool("document_get_pages", {"documentId": ids_long["long"], "pageFrom": 1, "pageTo": 1}),
-        ScriptStep.tool("document_get_pages", {"documentId": ids_long["long"], "pageFrom": 1, "pageTo": 1,
-                                              "charOffset": 5880}),
-        ScriptStep.tool("document_get_pages", {"documentId": ids_long["long"], "pageFrom": 1, "pageTo": 1,
-                                              "charOffset": 11760}),
-        ScriptStep.final(
-            "全卷阅卷：长篇合同第1页，原文「甲方杭州甲方向乙方上海乙方出售办公设备一批」，"
-            "该页共 14000 字，已分三次游标读至末尾，无未读片段。"
-        ),
-    ], "full_review_long_page")
+    long_steps = [ScriptStep.tool("documents_list", {})]
+    long_steps.append(ScriptStep.tool(
+        "document_get_pages", {"documentId": ids_long["long"], "pageFrom": 1, "pageTo": 1}))
+    for off in offsets:
+        long_steps.append(ScriptStep.tool(
+            "document_get_pages", {"documentId": ids_long["long"], "pageFrom": 1, "pageTo": 1,
+                                  "charOffset": off}))
+    long_steps.append(ScriptStep.final(
+        "全卷阅卷：长篇合同第1页，原文「甲方杭州甲方向乙方上海乙方出售办公设备一批」，"
+        f"该页共 {len(long_text)} 字，已分 {1 + len(offsets)} 次游标读至末尾，无未读片段。"
+    ))
+    long_row = _measure_steps(case_long["id"], "全卷阅卷：通读长篇合同", long_steps,
+                              "full_review_long_page")
 
     # 形态 2：单份材料 30 页短页——一次调用应覆盖全部页，不应退化为一页一调
     short_pages = {i: f"第{i}页 送货记录：收到办公设备一批，价款三十万元整。" for i in range(1, 31)}
@@ -999,13 +1009,13 @@ def _corpus_shape_rows() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     multi_docs = {s["documentId"] for s in multi_slices}
 
     rows = [
-        # 长页：多次游标续读，偏移递增且拼起来正好 14,000 字（无损，无重复读）
+        # 长页：多次游标续读，偏移递增且拼起来正好等于原文字数（无损，无重复读）
         {"step": "corpusLongPageLossless",
          "ok": long_row["lifecycle"] == "COMPLETED"
          and int(long_row["readPages"] or 0) == 1
-         and len(long_slices) >= 3
+         and len(long_slices) == 1 + len(offsets)
          and long_offsets == sorted(long_offsets)
-         and long_chars == 14000
+         and long_chars == len(long_text)
          and no_waste(long_row),
          "lifecycle": long_row["lifecycle"], "reads": long_slices,
          "readChars": long_chars, "efficiency": long_row.get("efficiency")},

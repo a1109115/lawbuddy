@@ -1,9 +1,19 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type {
   AgentEventNotification,
+  AgentRuntimeStatus,
   AgentTaskEvent,
   AgentTaskInfo,
+  AgentTracePayload,
   ArtifactAnnotation,
+  ArtifactRollbackResult,
+  ArtifactSnapshot,
+  BudgetReservationSummary,
+  ConversationBranchResult,
+  ConversationDeleteResult,
+  ConversationListItem,
+  ConversationSearchHit,
+  ConversationStats,
   ArtifactEditable,
   ArtifactEditSaveResult,
   ArtifactExportResult,
@@ -37,7 +47,14 @@ import type {
   DocGenTemplateField,
   DocGenTemplateImportInput,
   DocGenTemplateVersion,
+  DiagnosticsSnapshot,
   DocumentAnnotation,
+  LearningProposal,
+  ModelHealth,
+  PluginReview,
+  PluginSubsystemStatus,
+  PluginSummary,
+  ProviderConformance,
   DocumentContentChunk,
   DocumentContentInfo,
   DocumentImportProgress,
@@ -76,7 +93,15 @@ import type {
   TextDiffResult,
   WordNode,
   SheetCellChange,
+  SkillStagingDetail,
+  SkillStagingEntry,
+  SkillVersion,
   SlideTextChange,
+  SubagentRun,
+  RecoveryCenterPayload,
+  AutomationCapability,
+  AutomationRunResult,
+  ToolJournalEntry,
   WorkspaceInfo
 } from '@lawbuddy/contracts'
 
@@ -231,7 +256,58 @@ const bridge: LawBuddyBridge = {
       const listener = (_e: Electron.IpcRendererEvent, n: AgentEventNotification): void => cb(n)
       ipcRenderer.on('agent:event', listener)
       return () => ipcRenderer.removeListener('agent:event', listener)
-    }
+    },
+    /** 运行时状态（WP01：Journal 计数 / 待处置 unknown / 租约 fencing token） */
+    runtimeStatus: (taskId) =>
+      ipcRenderer.invoke('agent:runtimeStatus', taskId) as Promise<AgentRuntimeStatus>,
+    toolJournal: (req) =>
+      ipcRenderer.invoke('agent:toolJournal', req) as Promise<ToolJournalEntry[]>,
+    subagentRuns: (req) =>
+      ipcRenderer.invoke('agent:subagentRuns', req) as Promise<SubagentRun[]>,
+    recoveryCenter: (req) =>
+      ipcRenderer.invoke('agent:recoveryCenter', req) as Promise<RecoveryCenterPayload>,
+    resolveToolCall: (req) =>
+      ipcRenderer.invoke('agent:resolveToolCall', req) as Promise<{
+        taskId: string
+        entry: ToolJournalEntry
+      }>,
+    trace: (req) => ipcRenderer.invoke('agent:trace', req) as Promise<AgentTracePayload>,
+    compactionArchive: (req) =>
+      ipcRenderer.invoke('agent:compactionArchive', req) as Promise<{
+        taskId: string
+        archiveId: string
+        messages: Array<Record<string, unknown>>
+      }>,
+    budgetReservations: (req) =>
+      ipcRenderer.invoke('agent:budgetReservations', req) as Promise<BudgetReservationSummary>,
+    releaseSubagentBudget: (req) =>
+      ipcRenderer.invoke('agent:releaseSubagentBudget', req) as Promise<{
+        taskId: string
+        released: number
+      }>
+  },
+  /** 本地诊断（WP03：无外部遥测） */
+  diagnostics: {
+    snapshot: () =>
+      ipcRenderer.invoke('diagnostics:snapshot') as Promise<DiagnosticsSnapshot>,
+    export: () =>
+      ipcRenderer.invoke('diagnostics:export') as Promise<{ fileName: string; sizeBytes: number } | null>
+  },
+  /** 会话管理（WP05：搜索 / 分支 / 彻底删除 / 产物快照） */
+  conversation: {
+    list: (req) =>
+      ipcRenderer.invoke('conversation:list', req) as Promise<ConversationListItem[]>,
+    search: (req) =>
+      ipcRenderer.invoke('conversation:search', req) as Promise<ConversationSearchHit[]>,
+    branch: (req) =>
+      ipcRenderer.invoke('conversation:branch', req) as Promise<ConversationBranchResult>,
+    delete: (req) =>
+      ipcRenderer.invoke('conversation:delete', req) as Promise<ConversationDeleteResult>,
+    snapshots: (req) =>
+      ipcRenderer.invoke('conversation:snapshots', req) as Promise<ArtifactSnapshot[]>,
+    rollback: (req) =>
+      ipcRenderer.invoke('conversation:rollback', req) as Promise<ArtifactRollbackResult>,
+    stats: (req) => ipcRenderer.invoke('conversation:stats', req) as Promise<ConversationStats>
   },
   settings: {
     get: (key) => ipcRenderer.invoke('settings:get', key) as Promise<unknown>,
@@ -251,7 +327,11 @@ const bridge: LawBuddyBridge = {
     fetchModels: (req) =>
       ipcRenderer.invoke('model:fetchModels', req) as Promise<FetchedModelInfo[]>,
     testConnection: (req) =>
-      ipcRenderer.invoke('model:testConnection', req) as Promise<ModelTestResult>
+      ipcRenderer.invoke('model:testConnection', req) as Promise<ModelTestResult>,
+    /** 服务商健康（WP02：只返回 configured 与能力，不回传密钥） */
+    health: () => ipcRenderer.invoke('model:health') as Promise<ModelHealth>,
+    conformance: (req) =>
+      ipcRenderer.invoke('model:conformance', req) as Promise<ProviderConformance>
   },
   approval: {
     respond: (req) =>
@@ -491,7 +571,85 @@ const bridge: LawBuddyBridge = {
   /** 技能（REQ-AI-003 / REQ-AI-007；安装走 Agent 工具 skill_install） */
   skill: {
     list: () => ipcRenderer.invoke('skill:list', {}) as Promise<SkillInfo[]>,
-    remove: (req) => ipcRenderer.invoke('skill:remove', req) as Promise<{ removed: boolean }>
+    remove: (req) => ipcRenderer.invoke('skill:remove', req) as Promise<{ removed: boolean }>,
+    /** 暂存列表（WP09：不含提示词正文） */
+    staging: (req) =>
+      ipcRenderer.invoke('skill:staging', req) as Promise<SkillStagingEntry[]>,
+    stage: (req) => ipcRenderer.invoke('skill:stage', req) as Promise<SkillStagingDetail>,
+    stagingDetail: (req) =>
+      ipcRenderer.invoke('skill:stagingDetail', req) as Promise<SkillStagingDetail>,
+    approveStaging: (req) =>
+      ipcRenderer.invoke('skill:approveStaging', req) as Promise<{
+        skillId: string
+        versionId: string
+        name: string
+        status: string
+      }>,
+    rejectStaging: (req) =>
+      ipcRenderer.invoke('skill:rejectStaging', req) as Promise<SkillStagingDetail>,
+    versions: (req) => ipcRenderer.invoke('skill:versions', req) as Promise<SkillVersion[]>,
+    diff: (req) =>
+      ipcRenderer.invoke('skill:diff', req) as Promise<{
+        skillId: string
+        fromVersion: number
+        toVersion: number
+        diff: string
+        oldSha256: string
+        newSha256: string
+      }>,
+    rollback: (req) =>
+      ipcRenderer.invoke('skill:rollback', req) as Promise<{
+        skillId: string
+        activeVersion: number
+        rolledBack: boolean
+      }>
+  },
+  /** 学习提案（WP08：批准后才进入 Prompt / 召回 / 正式记忆） */
+  learning: {
+    proposals: (req) =>
+      ipcRenderer.invoke('learning:proposals', req) as Promise<LearningProposal[]>,
+    approve: (req) =>
+      ipcRenderer.invoke('learning:approve', req) as Promise<
+        LearningProposal & { applied: Record<string, unknown> }
+      >,
+    reject: (req) => ipcRenderer.invoke('learning:reject', req) as Promise<LearningProposal>,
+    rollback: (req) => ipcRenderer.invoke('learning:rollback', req) as Promise<LearningProposal>
+  },
+  /** 受限本地自动化（M8：只读检查，无外发、无后台定时器） */
+  automation: {
+    status: () => ipcRenderer.invoke('automation:status') as Promise<AutomationCapability>,
+    run: (req) =>
+      ipcRenderer.invoke('automation:run', req) as Promise<AutomationRunResult>
+  },
+  /** 插件 / MCP / 执行后端（WP10：默认全部禁用，子进程隔离） */
+  plugin: {
+    status: () => ipcRenderer.invoke('plugin:status') as Promise<PluginSubsystemStatus>,
+    list: (req) => ipcRenderer.invoke('plugin:list', req) as Promise<PluginSummary[]>,
+    review: (req) =>
+      ipcRenderer.invoke('plugin:review', req) as Promise<{
+        manifest: PluginSummary
+        review: PluginReview
+      }>,
+    install: (req) =>
+      ipcRenderer.invoke('plugin:install', req) as Promise<
+        PluginSummary & { review: PluginReview }
+      >,
+    enable: (req) =>
+      ipcRenderer.invoke('plugin:enable', req) as Promise<PluginSummary & { granted: string[] }>,
+    disable: (req) => ipcRenderer.invoke('plugin:disable', req) as Promise<PluginSummary>,
+    uninstall: (req) =>
+      ipcRenderer.invoke('plugin:uninstall', req) as Promise<{
+        pluginId: string
+        uninstalled: boolean
+        toolsRemoved: number
+        restartScheduled: false
+      }>,
+    mcpServers: () =>
+      ipcRenderer.invoke('plugin:mcpServers') as Promise<
+        Array<PluginSummary | Record<string, unknown>>
+      >,
+    mcpShutdown: () =>
+      ipcRenderer.invoke('plugin:mcpShutdown') as Promise<{ cleaned: number }>
   }
 }
 

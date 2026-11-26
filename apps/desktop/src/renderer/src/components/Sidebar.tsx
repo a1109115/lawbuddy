@@ -73,6 +73,11 @@ export function Sidebar(): JSX.Element {
     setClaimsQueueOpen,
     setAuditOpen,
     setSkillDialogOpen,
+    setRecoveryOpen,
+    setConversationOpen,
+    setLearningOpen,
+    setPluginOpen,
+    setModelHealthOpen,
     setMemoryOpen
   } = useApp()
   const claimsQueueCount = useApp((s) => s.claimsQueueCount)
@@ -357,6 +362,46 @@ export function Sidebar(): JSX.Element {
           >
             <Icon id="i-bulb" />
             技能库
+          </button>
+          <button
+            className="side-item"
+            onClick={() => setConversationOpen(true)}
+            title="会话管理：检索对话原文、分支、彻底删除与产物回滚"
+          >
+            <Icon id="i-search" />
+            会话管理
+          </button>
+          <button
+            className="side-item"
+            onClick={() => setRecoveryOpen(true)}
+            title="恢复中心：失败/中断任务、副作用未知调用的人工处置"
+          >
+            <Icon id="i-rotate" />
+            恢复中心
+          </button>
+          <button
+            className="side-item"
+            onClick={() => setLearningOpen(true)}
+            title="学习提案：记忆提案与技能暂存，批准后才生效"
+          >
+            <Icon id="i-bulb" />
+            学习提案
+          </button>
+          <button
+            className="side-item"
+            onClick={() => setModelHealthOpen(true)}
+            title="模型健康：服务商配置状态、最近错误类别与本地诊断导出"
+          >
+            <Icon id="i-shield" />
+            模型健康
+          </button>
+          <button
+            className="side-item"
+            onClick={() => setPluginOpen(true)}
+            title="扩展审批：逐项授予 MCP/插件的高风险能力"
+          >
+            <Icon id="i-layers" />
+            扩展审批
           </button>
           <button className="side-item" onClick={() => setAuditOpen(true)} title="审计与诊断">
             <Icon id="i-gear" />

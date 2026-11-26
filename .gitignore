@@ -53,3 +53,14 @@ services/core/evals/reports/
 **/profile.db
 **/workspace.db
 **/workspace.json
+# 本地运行数据：工作空间加密密钥、本地数据库与附件分块（敏感，绝不上传）
+.lawbuddy/
+lawbuddy.db
+lawbuddy.db-*
+blobs/
+# 设备级技能目录（按本机 ownerId 命名，属于本机安装状态而非项目源码）
+services/core/seed/skills/@user_*/
+# 本地临时测试技能
+services/core/seed/skills/_installed/测试技能A/
+# 演示与宣传材料（含 21MB PDF 与数十张截图，体积大且仅本地使用）
+docs/presentation/

@@ -32,6 +32,18 @@ OUTPUT_LIMIT = 8000        # bash stdout/stderr 回灌截断（字符）
 BASH_READ_CAP = 1_000_000  # bash 输出读取软上限（字符），超限丢弃后续内容防内存膨胀
 HTML_MAX_BYTES = 200_000   # render_html 单次渲染上限（约 200KB）
 
+# 原件区（WFA-LAW §4.4 / P1-06）：这些目录内是用户导入的原件与内部密钥材料，
+# 只能经文档管线（document_search / document_get_pages）读取，不开放给文件工具
+# 与 shell —— 否则模型在检索失效时会绕过分页、引用回查与 OCR 置信度直接读原文，
+# 使"每条结论可回溯原文"的校验失去意义。写入侧另由 _guard_writable 兜底。
+READONLY_ZONES = ("inputs",)
+# 迁移期警告模式（§6 R2）：策略刚上线时，依赖 shell 的既有工作流可能被误拒。
+# 开启后只记审计与告警、不阻断执行，给用户 2 周迁移窗口；默认关闭（硬拦截）。
+# 仅对"读取"生效——写入原件区在任何模式下都拒绝（原件只读是产品硬约束）。
+_READONLY_WARN_ONLY = os.environ.get("LAWBUDDY_READONLY_WARN_ONLY", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
 
 # ---------------------------------------------------------------------------
 # 路径安全
@@ -48,6 +60,124 @@ def _protected_parts() -> set[str]:
     from .workspace import BLOB_DIRNAME, DB_FILENAME
 
     return {DB_FILENAME, f"{DB_FILENAME}-wal", f"{DB_FILENAME}-shm", BLOB_DIRNAME, ".lawbuddy", ".lawbuddy-temp"}
+
+
+def _rel_parts(root: Path, path: Path) -> tuple[str, ...]:
+    try:
+        return path.relative_to(root).parts
+    except ValueError:
+        return path.parts
+
+
+def readonly_zone(root: Path, path: Path) -> str | None:
+    """命中只读原件区时返回区域名（供拒绝提示与审计），否则返回 None。"""
+    parts = _rel_parts(root, path)
+    if not parts:
+        return None
+    head = parts[0]
+    if head in READONLY_ZONES:
+        return head
+    # 内容存储与内部目录（含密钥材料）同样不可直接读取
+    from .workspace import BLOB_DIRNAME
+
+    if head in (BLOB_DIRNAME, ".lawbuddy", ".lawbuddy-temp"):
+        return head
+    return None
+
+
+def _allow_read_paths(state: dict[str, Any] | None) -> list[str]:
+    """任务级只读白名单（tool_policy.allowReadPaths，§4.4 第 2 条）。
+
+    仅供确有需要的调试场景：白名单只放宽"读取"，写入仍受 _guard_writable 限制，
+    且密钥材料（.lawbuddy 下的 dek.key 等）永不进入白名单。
+    """
+    policy = (state or {}).get("tool_policy") or {}
+    raw = policy.get("allowReadPaths") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    out: list[str] = []
+    for item in raw if isinstance(raw, list) else []:
+        text = str(item or "").strip().replace("\\", "/")
+        while text.startswith("./"):
+            text = text[2:]
+        text = text.lstrip("/")
+        if not text or ".." in text.split("/"):
+            continue
+        # 内部目录（密钥材料所在）永不放宽
+        if text.split("/")[0] in (".lawbuddy", ".lawbuddy-temp"):
+            continue
+        out.append(text)
+    return out
+
+
+def _deny_readonly(root: Path, path: Path, state: dict[str, Any] | None, zone: str) -> bool | None:
+    """原件区读取拒绝：给出可执行的替代路径，并把拦截事件写入审计。
+
+    迁移期警告模式（LAWBUDDY_READONLY_WARN_ONLY=1）下改为记审计 + 返回告警文本，
+    由调用方随结果带回给模型（不阻断执行）；默认硬拦截。
+    """
+    rel = _rel(root, path)
+    allowed = _allow_read_paths(state)
+    if any(rel == a or rel.startswith(a.rstrip("/") + "/") for a in allowed):
+        return None
+    _audit_blocked(state, "read", rel, zone)
+    if _READONLY_WARN_ONLY:
+        return True  # 调用方据此附加告警，不抛异常
+    raise ValueError(
+        f"「{rel}」属于只读原件区（{zone}），不能直接用文件工具或 Shell 读取。"
+        "请改用 document_search 检索、document_get_pages 分页精读（结果带页码与 OCR 质量，"
+        "可直接用于引用回查）；确需调试读取时由任务显式声明 toolPolicy.allowReadPaths。"
+    )
+
+
+def readonly_warning(rel: str, zone: str) -> str:
+    """迁移期告警文案：明确"本次放行"与"后续将拒绝"的边界。"""
+    return (
+        f"⚠ 原件区读取已放行（迁移期警告模式）：{rel}（区域 {zone}）。"
+        "正式策略下该读取会被拒绝，请改用 document_search / document_get_pages；"
+        "直读原文会绕过分页、引用回查与 OCR 置信度校验。"
+    )
+
+
+def _audit_blocked(state: dict[str, Any] | None, action: str, rel: str, zone: str) -> None:
+    """只读区拦截审计（仅路径与动作，不写文件内容；§4.4 第 3 条）。"""
+    if not state:
+        return
+    try:
+        from . import audit
+        from .storage import get_db
+
+        with get_db().transaction() as conn:
+            audit.append(
+                conn,
+                action="sandbox.readonly_blocked",
+                resource_type="task",
+                resource_id=str(state.get("task_id") or ""),
+                case_id=str(state.get("case_id") or "") or None,
+                result="denied",
+                metadata={"action": action, "path": _clip(rel, 200), "zone": zone},
+            )
+    except Exception:
+        pass  # 审计失败不改变拦截结论（拒绝已经生效）
+
+
+def _check_readable(root: Path, path: Path, state: dict[str, Any] | None) -> str | None:
+    """只读区读取检查；返回迁移期告警文本（正常模式返回 None 或抛错）。"""
+    zone = readonly_zone(root, path)
+    if zone is None:
+        return None
+    allowed = _deny_readonly(root, path, state, zone)
+    if allowed:
+        return readonly_warning(_rel(root, path), zone)
+    return None
+
+
+def _guard_outside_readonly(root: Path, path: Path) -> None:
+    """写操作禁止落在原件区：原件只读是产品硬约束（AGENTS.md），不是提示语。"""
+    zone = readonly_zone(root, path)
+    if zone is not None:
+        _audit_blocked(None, "write", _rel(root, path), zone)
+        raise ValueError(f"「{_rel(root, path)}」属于只读原件区（{zone}），禁止写入或修改")
 
 
 def _safe_path(root: Path, raw: Any) -> Path:
@@ -97,8 +227,15 @@ def _rel(root: Path, path: Path) -> str:
 # 文件工具
 # ---------------------------------------------------------------------------
 
-def read_file(root: Path, raw_path: Any, offset: int = 1, limit: int = 500) -> dict[str, Any]:
+def read_file(
+    root: Path,
+    raw_path: Any,
+    offset: int = 1,
+    limit: int = 500,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     path = _safe_path(root, raw_path)
+    warning = _check_readable(root, path, state)
     if not path.is_file():
         raise ValueError(f"文件不存在：{raw_path}")
     data = path.read_bytes()
@@ -110,7 +247,7 @@ def read_file(root: Path, raw_path: Any, offset: int = 1, limit: int = 500) -> d
     limit = max(1, min(READ_MAX_LINES, int(limit or 500)))
     chunk = lines[offset - 1: offset - 1 + limit]
     body = "\n".join(f"{offset + i:>6}\t{_clip(line, LINE_LIMIT)}" for i, line in enumerate(chunk))
-    return {
+    result = {
         "path": _rel(root, path),
         "totalLines": total,
         "offset": offset,
@@ -118,11 +255,15 @@ def read_file(root: Path, raw_path: Any, offset: int = 1, limit: int = 500) -> d
         "content": body,
         "note": "行号格式为「行号→内容」；文件较长时可用 offset/limit 分批读取",
     }
+    if warning:
+        result["warning"] = warning
+    return result
 
 
 def write_file(root: Path, raw_path: Any, content: Any) -> dict[str, Any]:
     path = _safe_path(root, raw_path)
     _guard_writable(path)
+    _guard_outside_readonly(root, path)
     text = content if isinstance(content, str) else str(content or "")
     path.parent.mkdir(parents=True, exist_ok=True)
     data = text.encode("utf-8")
@@ -143,6 +284,7 @@ def edit_file(root: Path, raw_path: Any, old_string: Any, new_string: Any, repla
         raise ValueError("old_string 不能为空")
     path = _safe_path(root, raw_path)
     _guard_writable(path)
+    _guard_outside_readonly(root, path)
     if not path.is_file():
         raise ValueError(f"文件不存在：{raw_path}")
     data = path.read_bytes()
@@ -164,15 +306,21 @@ def edit_file(root: Path, raw_path: Any, old_string: Any, new_string: Any, repla
     }
 
 
-def glob_files(root: Path, pattern: Any, base: Any = ".") -> dict[str, Any]:
+def glob_files(
+    root: Path, pattern: Any, base: Any = ".", state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     pat = str(pattern or "").strip() or "**/*"
     start = _safe_path(root, base)
+    _check_readable(root, start, state)
     if not start.exists():
         raise ValueError(f"目录不存在：{base}")
     protected = _protected_parts()
     hits: list[Path] = []
     for p in start.glob(pat):
         if p.name in protected or any(part in (".lawbuddy", ".lawbuddy-temp") for part in p.parts):
+            continue
+        # 原件区不参与列举：避免模型据此拼出原件路径绕过文档管线
+        if readonly_zone(root, p.resolve()) is not None:
             continue
         hits.append(p)
         if len(hits) >= GLOB_MAX_RESULTS * 2:
@@ -198,6 +346,7 @@ def grep_search(
     file_glob: Any = None,
     ignore_case: bool = False,
     max_results: int = GREP_MAX_RESULTS,
+    state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     text_pattern = str(pattern or "").strip()
     if not text_pattern:
@@ -208,6 +357,7 @@ def grep_search(
     except re.error as exc:
         raise ValueError(f"正则表达式无效：{exc}")
     start = _safe_path(root, base)
+    _check_readable(root, start, state)
     if not start.exists():
         raise ValueError(f"目录不存在：{base}")
     glob_pat = str(file_glob or "").strip() or "**/*"
@@ -219,6 +369,8 @@ def grep_search(
             continue
         if any(part in (".lawbuddy", ".lawbuddy-temp") for part in p.parts):
             continue
+        if readonly_zone(root, p.resolve()) is not None:
+            continue  # 原件区不经文件工具检索（须走 document_search）
         try:
             if p.stat().st_size > GREP_MAX_FILE_BYTES:
                 continue
@@ -289,6 +441,95 @@ def _bash_env() -> dict[str, str]:
     if any((exe.parent / name).exists() for name in names):
         env["PATH"] = str(exe.parent) + os.pathsep + env.get("PATH", "")
     return env
+
+
+# 命令里的"疑似路径 token"切分：空白与常见 shell 分隔符都当边界，
+# 重定向（>、<）、管道（|）、赋值（=）不必单独解析，切完就已分开。
+_BASH_TOKEN_SPLIT_RE = re.compile(r"""[\s"'|&;<>()=,]+""")
+# 环境变量展开与家目录简写无法在解析期求出真实路径，按 fail-closed 处理。
+_BASH_EXPANSION_RE = re.compile(r"(%[A-Za-z_][A-Za-z0-9_()]*%|^~|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)")
+
+
+def _bash_escaped_paths(root: Path, command: str) -> list[str]:
+    """找出命令中解析后落在工作空间之外的路径 token。
+
+    bash 是自由文本命令，无法逐次校验实际打开的文件；文件工具已由 `_safe_path`
+    限定在工作空间内，shell 若不设边界，模型可用 `..\\其他目录\\x.json` 或绝对
+    路径直接读到工作空间外的材料（实测：读到评测 reference/answers.json 与
+    verify.py，跨案读取同样可行），使"可回溯原文"与"跨案召回 0"失效。
+    """
+    escaped: list[str] = []
+    for raw in _BASH_TOKEN_SPLIT_RE.split(command or ""):
+        token = raw.strip().strip('"').strip("'")
+        if not token or token in ("-", "."):
+            continue
+        # 纯短选项（/T、/F 等 taskkill 风格）不是路径
+        if re.fullmatch(r"/[A-Za-z]{1,3}", token):
+            continue
+        # 既无分隔符也不是 `..` 的普通词（命令名、参数值）不是路径
+        if ".." not in token and "\\" not in token and "/" not in token and token != "..":
+            continue
+        if _BASH_EXPANSION_RE.search(token):
+            escaped.append(token)  # 无法解析出真实路径，按越界处理
+            continue
+        candidate = Path(token)
+        resolved = candidate if candidate.is_absolute() else (root / candidate)
+        try:
+            resolved.resolve().relative_to(root)
+        except (ValueError, OSError):
+            escaped.append(token)
+    return escaped
+
+
+def _guard_bash_command(root: Path, command: str, state: dict[str, Any] | None) -> str | None:
+    """Shell 命令不得触碰只读原件区，也不得越出工作空间（P1-06 §4.4）。
+
+    bash 是自由文本命令，无法像文件工具那样在打开文件时逐次校验，因此在执行前
+    做一次路径引用检查：命中原件区/内容存储/内部目录即拒绝，并提示改用文档管线；
+    解析后落在工作空间外的路径同样拒绝（`..` 逃逸、绝对路径、环境变量展开）。
+    宁可误拒（模型可改用 read_file 于工作区或 document_* 读原件），也不放开
+    直读原件的旁路——那会让引用回查与 OCR 置信度校验形同虚设。
+
+    迁移期警告模式下返回告警文本（放行），由 bash 结果带回；默认抛错拒绝。
+    """
+    if not command:
+        return None
+    escaped = _bash_escaped_paths(root, command)
+    if escaped:
+        audit_path = _clip(escaped[0], 200)
+        _audit_blocked(state, "bash", audit_path, "outside")
+        raise ValueError(
+            f"该命令引用了工作空间之外的路径「{audit_path}」，已拒绝执行。"
+            "Shell 只能在工作空间目录内读写；工作空间外的案件材料、其他案件与本机"
+            "文件不得直接读取，请改用工作空间的相对路径，或经 document_search / "
+            "document_get_pages 读取本任务材料。"
+        )
+    allowed = _allow_read_paths(state)
+    normalized = command.replace("\\", "/")
+    zones = list(READONLY_ZONES)
+    from .workspace import BLOB_DIRNAME
+
+    zones += [BLOB_DIRNAME, ".lawbuddy"]
+    warnings: list[str] = []
+    for zone in zones:
+        # 匹配 `inputs/`、`cd inputs`、`"inputs/x.txt"`、`--file=inputs/...` 等引用
+        pattern = re.compile(rf"(?<![\w.-]){re.escape(zone)}(?:/|\b)", re.IGNORECASE)
+        for m in pattern.finditer(normalized):
+            tail = normalized[m.start():]
+            # 白名单按相对路径前缀放宽（仅读取用途）
+            if any(tail.startswith(a) for a in allowed):
+                continue
+            audit_path = normalized[max(0, m.start() - 20): m.start() + 60]
+            _audit_blocked(state, "bash", audit_path, zone)
+            if _READONLY_WARN_ONLY:
+                warnings.append(readonly_warning(audit_path, zone))
+                continue
+            raise ValueError(
+                f"该命令引用了只读原件区「{zone}」，已拒绝执行。"
+                "原件只能经 document_search / document_get_pages 读取（带页码与 OCR 质量，"
+                "可直接用于引用回查）；请在命令中改用工作区路径，或改用文档工具获取原文。"
+            )
+    return "\n".join(warnings) if warnings else None
 
 
 def bash_exec(
@@ -512,6 +753,24 @@ def _audit_pptx(task_id: str, case_id: str, slide_count: int, size: int, title: 
         pass  # 审计失败不阻断文件已生成的结果
 
 
+def _resume_after_approval(task_id: str) -> None:
+    """审批门禁通过后把任务从 WAITING_APPROVAL 复位为 RUNNING。
+
+    审批卡会把任务生命周期置为 WAITING_APPROVAL，但"通过门禁"不等于"用户刚刚
+    批准过"——长效授权（allow_task/allow_case）会让后续调用整体跳过审批分支。
+    因此复位必须发生在门禁之后、执行之前，且只在确实处于等待态时写库。
+    """
+    try:
+        from .agent import tasks as task_store
+
+        info = task_store.get_task(task_id)
+        if (info or {}).get("lifecycle") == "WAITING_APPROVAL":
+            task_store.update_lifecycle(task_id, "RUNNING", "shell")
+    except Exception:  # noqa: BLE001
+        # 状态复位是展示/取消路径的修正，失败不应阻断命令执行本身
+        pass
+
+
 def _audit_shell(task_id: str, case_id: str, command: str, result: dict[str, Any]) -> None:
     try:
         from . import audit
@@ -534,15 +793,20 @@ def execute_tool(state: dict[str, Any], name: str, args: dict[str, Any]) -> Any:
     """自主循环的沙箱工具入口（read/write/edit/glob/grep/bash）。"""
     root = workspace_root()
     if name == "read_file":
-        return read_file(root, args.get("path"), int(args.get("offset") or 1), int(args.get("limit") or 500))
+        return read_file(
+            root, args.get("path"), int(args.get("offset") or 1), int(args.get("limit") or 500), state,
+        )
     if name == "write_file":
         return write_file(root, args.get("path"), args.get("content"))
     if name == "edit_file":
         return edit_file(root, args.get("path"), args.get("oldString"), args.get("newString"), bool(args.get("replaceAll")))
     if name == "glob_files":
-        return glob_files(root, args.get("pattern"), args.get("path"))
+        return glob_files(root, args.get("pattern"), args.get("path"), state)
     if name == "grep_search":
-        return grep_search(root, args.get("pattern"), args.get("path"), args.get("glob"), bool(args.get("ignoreCase")))
+        return grep_search(
+            root, args.get("pattern"), args.get("path"), args.get("glob"),
+            bool(args.get("ignoreCase")), state=state,
+        )
     if name == "bash":
         return _bash_with_approval(state, root, args)
     if name == "render_html":
@@ -559,6 +823,8 @@ def _bash_with_approval(state: dict[str, Any], root: Path, args: dict[str, Any])
     command = str(args.get("command") or "").strip()
     if not command:
         raise ValueError("command 不能为空")
+    # 只读原件区检查放在审批之前：被策略拒绝的命令不应先打扰用户审批
+    warning = _guard_bash_command(root, command, state)
     task_id = str(state.get("task_id") or "")
     case_id = str(state.get("case_id") or "")
     payload_hash = command_hash(command)
@@ -589,6 +855,13 @@ def _bash_with_approval(state: dict[str, Any], root: Path, args: dict[str, Any])
                 "message": "用户未批准该命令（拒绝或审批超时）。不要原样重试同一命令；请改用其他方案，或向用户说明需要该命令的原因。",
             }
 
+    # 审批等待期间任务被置为 WAITING_APPROVAL。这里必须放在"权限门禁之后、
+    # 真正执行之前"：已有长效授权时上面的审批分支整体跳过，若只在批准分支里
+    # 复位，任务会一直停在 WAITING_APPROVAL（UI 显示"等待审批"，
+    # cancel() 也会走审批分支而非执行中分支）。只在实际处于该状态时写库，
+    # 避免每次 bash 都多一次 UPDATE。
+    task_id and _resume_after_approval(task_id)
+
     result = bash_exec(
         root, command,
         int(args.get("timeout") or BASH_TIMEOUT_DEFAULT),
@@ -600,4 +873,6 @@ def _bash_with_approval(state: dict[str, Any], root: Path, args: dict[str, Any])
 
         raise task_store.TaskCancelled("用户停止")
     _audit_shell(task_id, case_id, command, result)
+    if warning:
+        result["warning"] = warning
     return result
